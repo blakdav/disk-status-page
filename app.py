@@ -39,10 +39,36 @@ COUNTERS = {4, 12, 193}
 # Acknowledge cumulative counters, never current pending/unreadable sectors.
 ACKNOWLEDGEABLE = {5, 187, 188, 199}
 CONFIGS = []
+# What a disk should be doing, from its configured role (a cold spare should
+# be asleep, a pool disk awake), and the power state that matches it.
+EXPECTED_STATES = {'awake': 'awake', 'asleep': 'standby'}
 ACTION_TOKEN = ''
 JOBS = queue.Queue(maxsize=1)
 JOB_LOCK = threading.Lock()
 JOB = None
+
+
+def load_configs(path):
+    """Read the disk list (written by the NAS's Ansible) and refuse a bad one."""
+    configs = json.loads(Path(path).read_text())
+    if not isinstance(configs, list) or not configs:
+        raise ValueError('the disk list must be a non-empty JSON array')
+    serials = set()
+    for config in configs:
+        if not isinstance(config, dict):
+            raise ValueError('each disk must be a JSON object')
+        for key in ('label', 'serial', 'role'):
+            if not isinstance(config.get(key), str) or not config[key].strip():
+                raise ValueError(f'each disk needs a non-empty "{key}"')
+        # An empty or duplicate serial would match the wrong disk.
+        if config['serial'] in serials:
+            raise ValueError(f'serial {config["serial"]} is listed twice')
+        serials.add(config['serial'])
+        if config.get('expected_state') not in (None, *EXPECTED_STATES):
+            raise ValueError(f'{config["label"]}: expected_state must be "awake" or "asleep"')
+        if not isinstance(config.get('allow_spindown', False), bool):
+            raise ValueError(f'{config["label"]}: allow_spindown must be true or false')
+    return configs
 
 
 def require_data_marker():
@@ -339,6 +365,11 @@ def decorate_disk(disk, acknowledgements, now):
     smart['known_warnings'] = [i['message'] for i in issues if i['acknowledged']]
     disk['smart'] = smart
     disk['stale'] = now - disk.get('observed_at', 0) > INTERVAL * 2.5
+    # Only a current, known power state can contradict the expected one.
+    expected = EXPECTED_STATES.get(disk.get('expected_state'))
+    disk['unexpected_state'] = bool(expected and not disk['stale']
+                                    and disk.get('state') in ('awake', 'standby')
+                                    and disk['state'] != expected)
     disk['needs_attention'] = bool(disk['stale'] or disk.get('error')
                                    or disk.get('state') not in ('awake', 'standby')
                                    or smart.get('passed') is False or smart['active_warnings'])
@@ -483,10 +514,12 @@ def snapshot():
     disks = stored()
     now = time.time()
     # UI order comes from inventory, never SQLite row/update order.
+    # The current config wins over what was stored with the last observation,
+    # so a role change shows as soon as the app restarts with the new list.
     if CONFIGS:
-        disks = {c['serial']: disks.get(c['serial'], {
-            **c, 'state': 'unknown', 'observed_at': 0,
-            'error': 'Awaiting first observation'}) for c in CONFIGS}
+        disks = {c['serial']: {**disks.get(c['serial'], {
+            'state': 'unknown', 'observed_at': 0,
+            'error': 'Awaiting first observation'}), **c} for c in CONFIGS}
     with connect() as db:
         extended_tests = {s: json.loads(p) for s, p in db.execute('SELECT * FROM extended_tests')}
         acknowledgements = {(s, a): {"baseline": b, "acknowledged_at": t}
@@ -521,13 +554,14 @@ def collector_freshness(payload):
 def homepage_status(payload):
     summary = {'total': len(payload['disks']), 'awake': 0, 'sleeping': 0,
                'unknown': 0, 'attention': 0, 'known_issues': 0, 'health_unknown': 0,
-               'tests_running': 0, 'stale': 0}
+               'tests_running': 0, 'stale': 0, 'unexpected_state': 0}
     disks = []
     for disk in payload['disks']:
         state = 'stale' if disk.get('stale') else disk.get('state', 'unknown')
         state_label = {'awake': 'Awake', 'standby': 'Sleeping', 'unknown': 'Unknown', 'stale': 'Stale'}.get(state, 'Unknown')
         summary[{'awake': 'awake', 'standby': 'sleeping'}.get(state, 'unknown')] += 1
         summary['stale'] += int(bool(disk.get('stale')))
+        summary['unexpected_state'] += int(bool(disk.get('unexpected_state')))
         summary['attention'] += int(disk['needs_attention'])
         smart = disk.get('smart') or {}
         summary['known_issues'] += int(bool(smart.get('known_warnings')))
@@ -549,10 +583,17 @@ def homepage_status(payload):
         if disk['needs_attention'] and not attention and state not in ('stale', 'unknown'):
             attention.append('Needs attention')
         attention = list(dict.fromkeys(attention))
+        # e.g. "Cold spare · Sleeping", or "Cold spare · Awake (expected asleep)".
         description = state_label
+        if disk.get('unexpected_state'):
+            description += f" (expected {disk['expected_state']})"
+        if disk.get('role'):
+            description = f"{disk['role']} · {description}"
         if attention:
             description += ' · ' + '; '.join(attention)
         disks.append({'label': disk['label'], 'serial': disk['serial'],
+                      'role': disk.get('role'), 'expected_state': disk.get('expected_state'),
+                      'unexpected_state': bool(disk.get('unexpected_state')),
                       'state': state, 'health': health, 'description': description,
                       'unacknowledged_issues': attention,
                       'temperature': smart.get('temperature'),
@@ -847,7 +888,14 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    configs = json.loads(Path(os.getenv('DISKS_FILE', str(ROOT / 'disks.json'))).read_text())
+    # The disk list belongs to the NAS, not the image: Ansible writes it from
+    # its pool lists and Compose mounts it. Demo mode uses placeholder disks.
+    disks_file = os.getenv('DISKS_FILE') or (
+        str(ROOT / 'disks.example.json') if DEMO else '/config/disks.json')
+    try:
+        configs = load_configs(disks_file)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f'Cannot use disk list {disks_file}: {exc}')
     # Before anything writes to /data. Demo history is disposable.
     if not DEMO:
         require_data_marker()

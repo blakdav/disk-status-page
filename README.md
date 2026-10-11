@@ -26,8 +26,7 @@ disks, put unmounted spares in standby, or request extended SMART self-tests.
 - Reads kernel I/O counters without disk queries. These are cumulative
   counters and may reset after reboot; they do not identify a responsible app.
 - Stores only the latest SMART data per disk, not historical SMART trends.
-- Roles in `disks.json` describe intended usage, not actual mount status.
-  The ongoing migration must finish before treating the spares as unused.
+- Roles in the disk list describe intended usage, not actual mount status.
 
 Hardware compatibility and non-waking behavior through the JMicron
 controller remain to be validated on debian-nas. There is no fallback to
@@ -152,18 +151,32 @@ rebinding (a foreign page pointing its own domain at the NAS). Add the NPM
 hostname when you set one up. If `ALLOWED_HOSTS` is empty, controls stay
 disabled. Reading the dashboard is unaffected.
 
-Optional disk configuration override:
+### Disk list
 
-```yaml
-    environment:
-      DISKS_FILE: /config/disks.json
-    volumes:
-      - ./disks.json:/config/disks.json:ro
+The image contains no disk list. The app reads `/config/disks.json`, which
+Compose mounts from a `config` folder beside `docker-compose.yml`, and
+refuses to start if it is missing or invalid. On the NAS, the homelab
+playbook writes it (`ansible-playbook nas.yml --tags disk_status_setup`) from
+its pool lists and restarts the container when it changes, so moving a disk
+between the spare and pool lists there updates the dashboard. Each entry:
+
+```json
+{"label": "data3", "serial": "WD-...", "role": "Cold spare",
+ "expected_state": "asleep", "allow_spindown": true}
 ```
 
-Merge these entries into the existing service rather than replacing its
-other environment or volume settings. Recreate the container after changing
-the disk configuration.
+- `label`: the disk's name (its filesystem label). `serial`: as in
+  `/dev/disk/by-id/ata-*_<serial>`; empty and duplicate serials are refused.
+- `role`: shown under the name and in Homepage rows.
+- `expected_state`: `awake` or `asleep` (optional). A disk observed in the
+  other state is marked as unexpected on its card, counted in the summary,
+  and flagged in Homepage, without counting as needing attention: waking a
+  spare on purpose is normal.
+- `allow_spindown`: whether the dashboard may put the disk to sleep.
+
+[disks.example.json](disks.example.json) has placeholder disks, used by demo
+mode. `DISKS_FILE` overrides the path. Disk cards and Homepage rows keep the
+list's order.
 
 `/api/status` exposes current values and recent history. `/healthz` reports
 collector freshness, independently of whether individual disks are healthy
@@ -293,7 +306,9 @@ reach the NAS on port 8088. See the
 The example has not yet been applied to your live Homepage configuration.
 
 Summary fields include `total`, `awake`, `sleeping`, `unknown`, `attention`,
-`known_issues`, `health_unknown`, `tests_running`, and `stale`. Counts refer
+`known_issues`, `health_unknown`, `tests_running`, `stale`, and
+`unexpected_state`. Each disk row also carries `role`, `expected_state`
+and `unexpected_state`. Counts refer
 to disks, not numbers of warnings. Stale state is never counted as awake or
 sleeping. A disk that has never provided health data is marked health
 unknown rather than failed. The detailed panel makes that distinction
@@ -340,7 +355,7 @@ The GHCR workflow continues to publish `latest` and a commit-specific
 `sha-<full-commit-sha>` tag. If the package is private, authenticate on the
 NAS as described under Publishing before pulling.
 
-Disk cards and Homepage rows retain inventory order from `disks.json`,
+Disk cards and Homepage rows retain inventory order from the disk list,
 including during partial collection and individual disk actions. Database
 updates do not determine their display order.
 
@@ -388,8 +403,10 @@ publishes `latest` and a full-commit-specific tag. New tracking code has unit
 test coverage; live NAS and browser verification remain pending deployment.
 
 
-Homepage disk descriptions show only power state and unacknowledged issues,
-for example `Sleeping`, `Awake`, or `Awake · Reallocated_Sector_Ct: 201`.
+Homepage disk descriptions show the role, power state and unacknowledged
+issues, for example `Cold spare · Sleeping`, `Pool data · Awake`,
+`Cold spare · Awake (expected asleep)`, or
+`Pool data · Awake · Reallocated_Sector_Ct: 201`.
 Healthy labels, acknowledged warnings, and self-test progress are omitted
 from the compact list; full details remain in Disk Status Page. Stale or
 unknown disk state remains visible. Pool Capacity includes total, used, free,

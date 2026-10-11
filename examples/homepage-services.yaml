@@ -27,9 +27,14 @@
             - field: summary.attention
               label: "Attention"
               format: number
+            # Disks awake that should sleep (or the reverse), from their role.
+            - field: summary.unexpected_state
+              label: "Unexpected"
+              format: number
     # Optional detailed panel; requires a Homepage version supporting
-    # Custom API dynamic-list. Only power state and unacknowledged issues
-    # appear in each row; healthy/acknowledged labels are omitted.
+    # Custom API dynamic-list. Each row shows the disk's role and power
+    # state, flags a state its role does not expect, and lists only
+    # unacknowledged issues, e.g. "Cold spare · Awake (expected asleep)".
     - Disk Details:
         href: http://172.23.24.16:8088
         siteMonitor: http://172.23.24.16:8088/healthz

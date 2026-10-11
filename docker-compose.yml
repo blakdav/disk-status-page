@@ -44,6 +44,16 @@ services:
         target: /data
         bind:
           create_host_path: false
+      # The disk list (config/disks.json beside this file): each disk's
+      # label, serial, role and expected power state. The NAS's Ansible
+      # writes it from its pool lists and restarts the container when it
+      # changes. A folder, not the file, so a replaced file is seen.
+      - type: bind
+        source: ./config
+        target: /config
+        read_only: true
+        bind:
+          create_host_path: false
       # The host's /dev, for the serial-based udev links (by-id), which
       # follow disks across reboots. Mounted beside the container's own /dev,
       # and not recursively, so the host's /dev/shm, /dev/pts and /dev/mqueue

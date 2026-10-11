@@ -547,3 +547,84 @@ class DataMarkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch('app.DB', Path(directory) / 'history.sqlite3'), patch('app.DATA_MARKER', ''):
             app.require_data_marker()
+
+
+class DiskListTests(unittest.TestCase):
+    def load(self, value):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'disks.json'
+            path.write_text(value if isinstance(value, str) else __import__('json').dumps(value))
+            return app.load_configs(path)
+
+    def test_example_list_is_valid(self):
+        configs = app.load_configs(Path(app.ROOT) / 'disks.example.json')
+        self.assertEqual({c['expected_state'] for c in configs if c['role'] == 'Cold spare'}, {'asleep'})
+
+    def test_bad_lists_are_refused(self):
+        good = {'label': 'data1', 'serial': 'S1', 'role': 'Pool data'}
+        for bad in ('not json', [], {}, [good, {**good, 'label': 'data2'}],
+                    [{**good, 'serial': ''}], [{**good, 'serial': ' '}],
+                    [{k: v for k, v in good.items() if k != 'role'}],
+                    [{**good, 'expected_state': 'standby'}],
+                    [{**good, 'allow_spindown': 'yes'}]):
+            with self.assertRaises(ValueError, msg=bad):
+                self.load(bad)
+        self.assertEqual(self.load([good])[0]['label'], 'data1')
+
+
+class ExpectedStateTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.patch = patch('app.DB', Path(self.directory.name) / 'history.sqlite3')
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.addCleanup(self.directory.cleanup)
+        app.initialize()
+
+    def homepage(self, configs, states):
+        import time
+        for config, state in zip(configs, states):
+            app.save({**config, 'state': state, 'observed_at': time.time(),
+                      'smart': {'passed': True}}, {})
+        with patch('app.CONFIGS', configs):
+            return app.homepage_status(app.snapshot())
+
+    def test_spare_awake_is_flagged_but_not_attention(self):
+        configs = [{'serial': 's', 'label': 'data3', 'role': 'Cold spare', 'expected_state': 'asleep'},
+                   {'serial': 'p', 'label': 'data1', 'role': 'Pool data', 'expected_state': 'awake'}]
+        result = self.homepage(configs, ['awake', 'awake'])
+        spare, pool = result['disks']
+        self.assertTrue(spare['unexpected_state'])
+        self.assertEqual(spare['description'], 'Cold spare · Awake (expected asleep)')
+        self.assertEqual(spare['role'], 'Cold spare')
+        self.assertFalse(spare['needs_attention'])
+        self.assertFalse(pool['unexpected_state'])
+        self.assertEqual(pool['description'], 'Pool data · Awake')
+        self.assertEqual(result['summary']['unexpected_state'], 1)
+        self.assertEqual(result['summary']['attention'], 0)
+
+    def test_sleeping_spare_matches(self):
+        configs = [{'serial': 's', 'label': 'data3', 'role': 'Cold spare', 'expected_state': 'asleep'}]
+        disk = self.homepage(configs, ['standby'])['disks'][0]
+        self.assertFalse(disk['unexpected_state'])
+        self.assertEqual(disk['description'], 'Cold spare · Sleeping')
+
+    def test_stale_or_unknown_state_is_not_called_unexpected(self):
+        import time
+        config = {'serial': 's', 'label': 'data3', 'role': 'Cold spare', 'expected_state': 'asleep'}
+        app.save({**config, 'state': 'awake', 'observed_at': time.time() - 3600}, {})
+        with patch('app.CONFIGS', [config]):
+            self.assertFalse(app.snapshot()['disks'][0]['unexpected_state'])
+        app.save({**config, 'state': 'unknown', 'observed_at': time.time()}, {})
+        with patch('app.CONFIGS', [config]):
+            self.assertFalse(app.snapshot()['disks'][0]['unexpected_state'])
+
+    def test_config_change_overrides_stored_role(self):
+        import time
+        old = {'serial': 's', 'label': 'data3', 'role': 'Cold spare', 'expected_state': 'asleep'}
+        app.save({**old, 'state': 'awake', 'observed_at': time.time()}, {})
+        new = {**old, 'role': 'Pool data', 'expected_state': 'awake'}
+        with patch('app.CONFIGS', [new]):
+            disk = app.snapshot()['disks'][0]
+        self.assertEqual(disk['role'], 'Pool data')
+        self.assertFalse(disk['unexpected_state'])

@@ -2,49 +2,57 @@
   {
     "label": "data1",
     "role": "Pool data",
-    "serial": "ZGY8RZSW",
+    "serial": "EXAMPLE-DATA1",
+    "expected_state": "awake",
     "allow_spindown": false
   },
   {
     "label": "data2",
     "role": "Pool data",
-    "serial": "ZGY8R853",
+    "serial": "EXAMPLE-DATA2",
+    "expected_state": "awake",
     "allow_spindown": false
   },
   {
     "label": "parity1",
     "role": "Parity",
-    "serial": "WD-WX22DA540ESV",
+    "serial": "EXAMPLE-PARITY1",
+    "expected_state": "awake",
     "allow_spindown": false
   },
   {
     "label": "data3",
     "role": "Cold spare",
-    "serial": "WD-WCC7K6PKXARD",
+    "serial": "EXAMPLE-DATA3",
+    "expected_state": "asleep",
     "allow_spindown": true
   },
   {
     "label": "data4",
     "role": "Cold spare",
-    "serial": "WD-WX22DA540VSH",
+    "serial": "EXAMPLE-DATA4",
+    "expected_state": "asleep",
     "allow_spindown": true
   },
   {
     "label": "data5",
     "role": "Cold spare",
-    "serial": "WD-WX22DA540UJ2",
+    "serial": "EXAMPLE-DATA5",
+    "expected_state": "asleep",
     "allow_spindown": true
   },
   {
     "label": "data6",
     "role": "Cold spare",
-    "serial": "WD-WCC7K6LTTK50",
+    "serial": "EXAMPLE-DATA6",
+    "expected_state": "asleep",
     "allow_spindown": true
   },
   {
     "label": "data7",
     "role": "Cold spare",
-    "serial": "ZGY8RNHK",
+    "serial": "EXAMPLE-DATA7",
+    "expected_state": "asleep",
     "allow_spindown": true
   }
 ]
