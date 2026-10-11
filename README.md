@@ -214,7 +214,7 @@ It does not prevent the drive's own standby timer or another host process
 from interrupting a test. The app never forcibly replaces a running test.
 
 Only configured disks can be targeted. `allow_spindown: true` enables
-spin-down eligibility; it is set only for the five intended spares. The
+spin-down eligibility; it is set only for the five cold spares. The
 server also checks the host's mounts, swap and kernel holders, and refuses
 spin-down if it cannot verify those checks. Mounted pool/parity disks are
 ineligible. A running or unreadable self-test status blocks spin-down on an
