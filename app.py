@@ -22,6 +22,13 @@ SMART_INTERVAL = max(INTERVAL, int(os.getenv('SMART_SECONDS', '1800')))
 DEMO = os.getenv('DEMO', 'false').lower() == 'true'
 STOP = threading.Event()
 DB = Path(os.getenv('DATA_DIR', '/data')) / 'history.sqlite3'
+# The host's /dev. Compose mounts it at /host/dev so the container keeps its
+# own /dev; udev's by-id links are relative, so they resolve inside it.
+DEV_DIR = os.getenv('DEV_DIR', '/dev').rstrip('/')
+# Host names the dashboard may be reached by. Disk controls answer only
+# requests addressed to one of these, which stops DNS rebinding: a foreign
+# page pointed at the NAS's IP still sends its own name as Host.
+ALLOWED_HOSTS = {h.strip().lower() for h in os.getenv('ALLOWED_HOSTS', '').split(',') if h.strip()}
 WARNINGS = {5, 187, 188, 197, 198, 199}
 COUNTERS = {4, 12, 193}
 # Acknowledge cumulative counters, never current pending/unreadable sectors.
@@ -76,7 +83,7 @@ def command(args):
 
 def device_for(serial):
     # Resolve existing udev links only; discovery must never probe a disk.
-    candidates = glob.glob('/dev/disk/by-id/ata-*_' + glob.escape(serial))
+    candidates = glob.glob(DEV_DIR + '/disk/by-id/ata-*_' + glob.escape(serial))
     return sorted(candidates)[0] if candidates else None
 
 
@@ -480,7 +487,7 @@ def snapshot():
     return {'demo': DEMO, 'poll_seconds': INTERVAL, 'smart_seconds': SMART_INTERVAL,
             'server_time': now, 'disks': [decorate_disk(d, acknowledgements, now) for d in disks.values()], 'events': events,
             'schedules': snapraid_schedules(), 'pool': pool_capacity(list(disks.values()), now),
-            'snapraid': snapraid_status(), 'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN) and not DEMO}
+            'snapraid': snapraid_status(), 'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN and ALLOWED_HOSTS) and not DEMO}
 
 
 def collector_freshness(payload):
@@ -575,9 +582,17 @@ def verify_unmounted(config, path):
     if any(line.split()[2] in devices for line in mounts):
         raise ValueError('Disk or a partition is mounted on the NAS')
     for line in Path('/host/swaps').read_text().splitlines()[1:]:
-        info = os.stat(line.split()[0])
+        # /proc/swaps names host paths; host device nodes live under DEV_DIR.
+        info = os.stat(re.sub(r'^/dev(?=/)', DEV_DIR, line.split()[0]))
         if f'{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}' in devices:
             raise ValueError('Disk is used for swap')
+
+
+def host_allowed(header):
+    # Host may carry a port; IPv6 literals are bracketed. Anything else
+    # (userinfo, paths, empty) is refused.
+    match = re.fullmatch(r'(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9.-]+)(:\d+)?', header or '')
+    return bool(match) and match[1].lower().strip('[]') in ALLOWED_HOSTS
 
 
 def wake_disk(path):
@@ -722,7 +737,8 @@ class Handler(BaseHTTPRequestHandler):
         # JSON plus a custom header prevents form-based cross-origin requests;
         # no CORS support is provided. Also reject foreign browser origins.
         origin = self.headers.get('Origin')
-        same_origin = not origin or urlsplit(origin).netloc == self.headers.get('Host')
+        same_origin = (host_allowed(self.headers.get('Host'))
+                       and (not origin or urlsplit(origin).netloc == self.headers.get('Host')))
         if self.path == '/api/unlock':
             # This is a deliberate-click guard, not user authentication.
             # Browsers cannot obtain the capability through a cross-origin POST.
@@ -812,6 +828,8 @@ if __name__ == '__main__':
     initialize()
     CONFIGS = configs
     ACTION_TOKEN = '' if DEMO else load_token()
+    if not ALLOWED_HOSTS and not DEMO:
+        logging.warning('ALLOWED_HOSTS is not set; disk controls stay disabled')
     def worker():
         try:
             run_collector(configs)

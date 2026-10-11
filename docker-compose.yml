@@ -3,20 +3,56 @@ services:
     image: ghcr.io/blakdav/disk-status-page:latest
     container_name: disk-status-page
     restart: unless-stopped
-    # Initial hardware-compatible configuration; reduce after NAS testing.
-    # This grants broad host access. Explicit disk actions require clicking Unlock controls on the dashboard.
-    privileged: true
+    # Not privileged. The app only needs to send ATA commands (power state,
+    # standby, SMART) to the SATA disks:
+    # - SYS_RAWIO and SYS_ADMIN: the kernel requires both for the ATA ioctls
+    #   hdparm and smartctl use. Every other capability is dropped.
+    # - device_cgroup_rules: read-only opens of sd* disks (block major 8,
+    #   sda-sdp). No other host devices can be opened.
+    # Docker's seccomp and AppArmor profiles stay in force.
+    cap_drop: [ALL]
+    cap_add: [SYS_RAWIO, SYS_ADMIN]
+    device_cgroup_rules:
+      - "b 8:* r"
+    security_opt:
+      - no-new-privileges:true
+    # Only /data (and /tmp for SQLite scratch files) is writable.
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
       - "8088:8080"
     environment:
       TZ: America/Los_Angeles
       POLL_SECONDS: "30"
       SMART_SECONDS: "1800"
+      DEV_DIR: /host/dev
+      # Names the dashboard is opened by, comma-separated. Disk controls
+      # refuse requests addressed to any other name (DNS rebinding). Add the
+      # Nginx Proxy Manager hostname here if you put one in front.
+      ALLOWED_HOSTS: "172.23.24.16,debian-nas"
     volumes:
       # NVMe storage: recording history must not wake the monitored disks.
-      - /mnt/vault/apps/disk-status-page:/data
-      # Includes serial-based udev links and supports disks across reboots.
-      - /dev:/dev:ro
+      # The vault mount is nofail, so Docker can start before it is mounted.
+      # create_host_path: false then fails the start instead of writing the
+      # history to an empty folder on the OS disk.
+      - type: bind
+        source: /mnt/vault/apps/disk-status-page
+        target: /data
+        bind:
+          create_host_path: false
+      # The host's /dev, for the serial-based udev links (by-id), which
+      # follow disks across reboots. Mounted beside the container's own /dev,
+      # and not recursively, so the host's /dev/shm, /dev/pts and /dev/mqueue
+      # stay out. Read-only does not stop writes to device nodes; the device
+      # rule above is what limits access.
+      - type: bind
+        source: /dev
+        target: /host/dev
+        read_only: true
+        bind:
+          recursive: disabled
+          create_host_path: false
       # Spin-down checks must use the NAS mount namespace, not the container's.
       - type: bind
         source: /proc/1/mountinfo
@@ -52,11 +88,15 @@ services:
         bind:
           propagation: rslave
           create_host_path: false
+      # rslave: mergerfs is nofail too and may mount after the container
+      # starts, or be remounted; without it the container keeps seeing the
+      # empty folder underneath.
       - type: bind
         source: /mnt/pool
         target: /host/pool
         read_only: true
         bind:
+          propagation: rslave
           create_host_path: false
       # Display the installed timer definitions rather than a hardcoded schedule.
       - type: bind

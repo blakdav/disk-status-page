@@ -112,17 +112,39 @@ docker compose pull
 docker compose up -d
 ```
 
-The initial Compose file uses `privileged: true` and a read-only `/dev` bind
-mount for controller compatibility and stable serial links. Privileged mode
-still grants broad host access; the read-only bind is not a security boundary
-against raw disk commands. Reduce permissions after testing actual hardware.
-The app runs as root for disk queries; PUID/PGID are not supported.
+The container is not privileged. It drops every capability except
+`SYS_RAWIO` and `SYS_ADMIN`, which the kernel requires for the ATA commands
+hdparm and smartctl send. A device rule (`b 8:* r`) allows read-only opens of
+the SATA disks (sda–sdp) and no other host devices. Its root filesystem is
+read-only; only `/data` and a `/tmp` tmpfs are writable. The host's `/dev` is
+mounted, not recursively, at `/host/dev` (`DEV_DIR`) for the serial-based
+by-id links, so the container keeps its own `/dev`. Read-only on that mount
+is not what protects the disks; the device rule is. Those two capabilities
+still let the app send raw ATA commands to the allowed disks, so treat a
+compromise of the container as able to damage their data.
+
+The app runs as root for disk queries; PUID/PGID are not supported. With
+every other capability dropped, that root can only write to a `/data` folder
+it owns: keep `/mnt/vault/apps/disk-status-page` owned by root, as Ansible
+creates it.
+
+The history mount uses `create_host_path: false`. `/mnt/vault` mounts with
+`nofail`, so Docker can start before it; the container then fails to start
+rather than writing history to an empty folder on the OS disk. Start it
+with `docker compose up -d` once the vault is mounted.
 
 Direct URL: http://172.23.24.16:8088. Configure Nginx Proxy Manager on the
 Docker VM to forward the chosen hostname to `172.23.24.16:8088`, enabling
 HTTPS there. No Docker network shared across hosts is needed. The dashboard
 is readable without login. Actions require clicking Unlock controls. Keep
 it on the trusted home network and use HTTPS through NPM for controls.
+
+`ALLOWED_HOSTS` (comma-separated) lists the names the dashboard is opened
+by; the supplied Compose file allows `172.23.24.16` and `debian-nas`. Unlock
+and actions refuse requests addressed to any other name, which blocks DNS
+rebinding (a foreign page pointing its own domain at the NAS). Add the NPM
+hostname when you set one up. If `ALLOWED_HOSTS` is empty, controls stay
+disabled. Reading the dashboard is unaffected.
 
 Optional disk configuration override:
 
@@ -214,8 +236,10 @@ remain in place. Anyone who can access the dashboard can unlock its controls.
 The server maintains an internal action capability at `/data/action-token`.
 The unlock button fetches it through a same-origin JSON POST and keeps it only
 in page memory. Action requests use a custom token header, JSON, and origin
-checks to reject cross-origin browser requests. This is a misclick guard, not
-user authentication. NPM must preserve the original Host header.
+checks to reject cross-origin browser requests, and the Host must be in
+`ALLOWED_HOSTS`. This is a misclick guard, not user authentication: any
+client on the network, such as curl, can still unlock. NPM must preserve the
+original Host header.
 
 ## Updating this version
 

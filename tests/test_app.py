@@ -186,10 +186,47 @@ class ActionTests(unittest.TestCase):
                                'X-Action-Token': token, 'Content-Type': 'application/json',
                                'Content-Length': str(len(raw))}.items():
                 handler.headers[key] = value
-            with patch('app.ACTION_TOKEN', 'secret'), patch('app.DEMO', False), patch('app.submit_job', return_value={'state': 'queued'}) as submit:
+            with patch('app.ACTION_TOKEN', 'secret'), patch('app.DEMO', False), patch('app.ALLOWED_HOSTS', {'nas.test'}), patch('app.submit_job', return_value={'state': 'queued'}) as submit:
                 handler.do_POST()
                 self.assertEqual(submit.call_count, int(expected == 202))
             self.assertIn(str(expected).encode(), handler.wfile.getvalue().split(b'\r\n')[0])
+
+    def test_device_lookup_uses_dev_dir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'disk/by-id').mkdir(parents=True)
+            (root / 'sdb').touch()
+            (root / 'disk/by-id/ata-Model_SER1').symlink_to('../../sdb')
+            with patch('app.DEV_DIR', str(root)):
+                path = app.device_for('SER1')
+            self.assertEqual(Path(path).resolve(), (root / 'sdb').resolve())
+
+    def test_swap_partition_is_found_under_dev_dir(self):
+        # /proc/swaps names /dev/sdb2; inside the container it is DEV_DIR/sdb2.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sys_disk = root / 'sys/sdb'
+            (sys_disk / 'holders').mkdir(parents=True)
+            (sys_disk / 'dev').write_text('8:16')
+            dev = root / 'dev'
+            dev.mkdir()
+            (dev / 'sdb').touch()
+            mounts = root / 'mountinfo'
+            mounts.write_text('1 0 8:1 / / rw - ext4 /dev/sda1 rw\n')
+            swaps = root / 'swaps'
+            swaps.write_text('Filename Type Size Used Priority\n/dev/sdb partition 1 0 -2\n')
+            original_path, original_stat = Path, app.os.stat
+            def paths(value):
+                return {'/sys/class/block': root / 'sys', '/host/mountinfo': mounts,
+                        '/host/swaps': swaps}.get(value, original_path(value))
+            def stat(value, *args, **kwargs):
+                if value == str(dev / 'sdb'):
+                    return type('Info', (), {'st_rdev': app.os.makedev(8, 16)})()
+                return original_stat(value, *args, **kwargs)
+            with patch('app.Path', side_effect=paths), patch('app.DEV_DIR', str(dev)), \
+                 patch('app.os.stat', side_effect=stat):
+                with self.assertRaisesRegex(ValueError, 'swap'):
+                    app.verify_unmounted({'allow_spindown': True}, str(dev / 'sdb'))
 
     def test_action_token_persists_with_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory, patch('app.DB', Path(directory) / 'history.sqlite3'):
