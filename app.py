@@ -371,6 +371,22 @@ def snapshot():
             'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN) and not DEMO}
 
 
+def collector_freshness(payload):
+    observations = [d.get('observed_at', 0) for d in payload['disks']]
+    interval = payload.get('poll_seconds', INTERVAL)
+    now = payload['server_time']
+    missing = not observations or any(not t for t in observations)
+    future = any(t > now + 5 for t in observations)
+    age = max((now - t for t in observations), default=0)
+    state = ('stale' if missing or future or age > interval * 3 else
+             'delayed' if age > interval * 2 else 'current')
+    labels = {'current': '🟢 Current', 'delayed': '🟠 Delayed', 'stale': '🔴 Stale'}
+    if missing:
+        labels['stale'] = '🔴 Awaiting data'
+    return {'state': state, 'label': labels[state],
+            'oldest_observation_age_seconds': max(0, age) if not missing else None}
+
+
 def homepage_status(payload):
     summary = {'total': len(payload['disks']), 'awake': 0, 'sleeping': 0,
                'unknown': 0, 'attention': 0, 'known_issues': 0, 'health_unknown': 0,
@@ -406,6 +422,7 @@ def homepage_status(payload):
                       'extended_test': disk.get('extended_test', {}),
                       'needs_attention': disk['needs_attention']})
     return {'demo': payload['demo'], 'summary': summary, 'disks': disks,
+            'freshness': collector_freshness(payload),
             'generated_at': payload['server_time']}
 
 
@@ -621,15 +638,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_HEAD(self):
+        if self.path.split('?')[0] != '/healthz':
+            self.send_error(405)
+            return
+        freshness = collector_freshness(snapshot())
+        self.send_response(200 if freshness['state'] == 'current' else 503)
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
     def do_GET(self):
         path = self.path.split('?')[0]
         if path in ('/api/status', '/api/homepage', '/healthz'):
             payload = snapshot()
             if path == '/healthz':
-                fresh = any(payload['server_time'] - d['observed_at'] < INTERVAL * 3
-                            for d in payload['disks'])
+                freshness = collector_freshness(payload)
+                fresh = freshness['state'] == 'current'
                 self.send_response(200 if fresh else 503)
-                body = json.dumps({'collector_recent': fresh}).encode()
+                body = json.dumps({'collector_recent': fresh, 'freshness': freshness}).encode()
             else:
                 self.send_response(200)
                 body = json.dumps(homepage_status(payload) if path == '/api/homepage' else payload).encode()

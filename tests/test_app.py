@@ -452,5 +452,44 @@ class ExtendedTestTrackingTests(unittest.TestCase):
             record.assert_not_called()
 
 
+class FreshnessTests(unittest.TestCase):
+    def payload(self, times):
+        return {'server_time': 1000, 'poll_seconds': 30,
+                'disks': [{'observed_at': t} for t in times]}
+
+    def test_current_delayed_and_stale_thresholds(self):
+        self.assertEqual(app.collector_freshness(self.payload([970, 940]))['state'], 'current')
+        self.assertEqual(app.collector_freshness(self.payload([970, 939]))['state'], 'delayed')
+        self.assertEqual(app.collector_freshness(self.payload([970, 909]))['state'], 'stale')
+
+    def test_one_stuck_disk_is_not_hidden_by_other_fresh_disks(self):
+        result = app.collector_freshness(self.payload([999, 999, 800]))
+        self.assertEqual(result['state'], 'stale')
+        self.assertEqual(result['oldest_observation_age_seconds'], 200)
+
+    def test_no_data_missing_disk_and_clock_anomaly_are_not_green(self):
+        for times in [[], [0, 999], [1100]]:
+            self.assertEqual(app.collector_freshness(self.payload(times))['state'], 'stale')
+
+    def test_health_get_and_head_fail_when_observations_are_stale(self):
+        import io
+        for method in ['GET', 'HEAD']:
+            for times, expected in [([999], 200), ([930], 503), ([800], 503), ([], 503)]:
+                handler = object.__new__(app.Handler)
+                handler.path = '/healthz'
+                handler.request_version = 'HTTP/1.1'
+                handler.command = method
+                handler.requestline = method + ' /healthz HTTP/1.1'
+                handler.wfile = io.BytesIO()
+                with patch('app.snapshot', return_value=self.payload(times)), patch('app.command') as command:
+                    getattr(handler, 'do_' + method)()
+                    command.assert_not_called()
+                response = handler.wfile.getvalue()
+                self.assertIn(str(expected).encode(), response.split(b'\r\n')[0])
+                self.assertIn(b'Cache-Control: no-store', response)
+                if method == 'HEAD':
+                    self.assertEqual(response.split(b'\r\n\r\n', 1)[1], b'')
+
+
 if __name__ == '__main__':
     unittest.main()

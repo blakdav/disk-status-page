@@ -158,7 +158,7 @@ smartd; host background monitoring remains separate from this container.
 
 ## Current validation
 
-Thirty-six unit tests pass, covering sleeping/unknown states, standby races,
+Forty unit tests pass, covering sleeping/unknown states, standby races,
 unsupported SMART power checks, health warning bits, persisted transitions,
 observation gaps, and HTTP responses tested without sockets. Python compiles,
 YAML parses, and `docker compose config --quiet` passes. This development
@@ -381,3 +381,50 @@ change can take roughly a minute to appear across both polling cycles.
 SMART health normally refreshes every 30 minutes on awake disks, and test
 status is refreshed each collection cycle once a running test is detected.
 Browser background throttling and command duration can delay updates.
+
+
+## Homepage freshness indicator
+
+The example now adds `siteMonitor: http://172.23.24.16:8088/healthz` and
+`statusStyle: dot` at the service level on both cards. Homepage makes this
+health request independently of the Custom API data request. The endpoint
+supports HEAD directly (and GET), returns no-store headers, and returns
+HTTP 200 only when every configured disk has a recent observation. It
+returns 503 for delayed, stale, missing or future-dated observations.
+Thus an HTTP server still running with a stalled collector cannot keep the
+monitor green just by accepting connections. A stopped/hung container or
+network failure makes Homepage's monitor fail on its next health check.
+See [Homepage site monitoring](https://gethomepage.dev/configs/services/#site-monitor)
+and [dot style](https://gethomepage.dev/configs/settings/#status-style).
+
+`/api/homepage` also includes `freshness.state` and `freshness.label`:
+
+- Green **Current**: oldest disk observation is at most two polling intervals old.
+- Orange **Delayed**: oldest observation is over two but at most three intervals old.
+- Red **Stale**: older than three intervals, missing, or a clock anomaly.
+
+At a 30-second collection interval these boundaries are 60 and 90 seconds.
+The native monitor dot is binary: green for Current, red for Delayed/Stale
+or an unreachable endpoint. The optional Data field displays the orange
+intermediate state. The summary example uses list mode so its fifth field
+is not silently dropped by Homepage's four-field block view. Existing
+four-block configurations may simply add the service monitor dot without
+changing their layout.
+
+Freshness describes collection, not disk health and not the age of cached
+SMART readings. Sleeping disks can have old SMART data with current power
+observations. A failed disk query can be a fresh error, still shown under
+Attention. No freshness requests issue hardware commands.
+
+A server-generated label alone cannot expire a response already frozen in
+another program. The independent Homepage monitor is therefore required;
+do not use only `freshness.label` as evidence of connectivity. Neither a
+native monitor nor a widget can repaint a browser tab that is itself frozen
+or suspended. Homepage/browser scheduling and proxy behavior determine how
+quickly a failed request is displayed; leave widget errors visible and do
+not enable caching on these endpoints.
+
+After publishing and pulling the new Disk Status Page image on the NAS,
+merge the two monitor lines from the example into Homepage's services.yaml
+on debian-docker and reload Homepage. This is an app/config update, with no
+Ansible or Compose changes needed.
