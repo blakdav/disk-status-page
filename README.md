@@ -158,7 +158,7 @@ smartd; host background monitoring remains separate from this container.
 
 ## Current validation
 
-Forty unit tests pass, covering sleeping/unknown states, standby races,
+Forty-four unit tests pass, covering sleeping/unknown states, standby races,
 unsupported SMART power checks, health warning bits, persisted transitions,
 observation gaps, and HTTP responses tested without sockets. Python compiles,
 YAML parses, and `docker compose config --quiet` passes. This development
@@ -363,16 +363,9 @@ publishes `latest` and a full-commit-specific tag. New tracking code has unit
 test coverage; live NAS and browser verification remain pending deployment.
 
 
-Homepage disk descriptions include colored Unicode markers for power and
-health separately: green awake/healthy, blue sleeping, purple testing, red
-attention, yellow known issues, and neutral unknown/stale. Cached testing
-status on a sleeping or stale disk is explicitly labeled last-read testing
-with a neutral marker. Text remains present so color is never the only
-signal. These markers work with the existing `description` mapping; no custom
-Homepage image or CSS is required. Appearance depends on the browser font.
-Custom API does not support dynamic block highlighting; this does not change
-Homepage's text/background colors. Optional summary labels in the example
-use the same markers, serving as a static legend rather than a health alert.
+Homepage disk descriptions are plain text. Optional scoped JavaScript/CSS
+colors each status phrase without modifying the native freshness dot; see
+Homepage text colors below. No custom Homepage image is required.
 
 Homepage requests the API on load and every 30 seconds while its page is
 active, as configured by `refreshInterval: 30000`. The API reads the app's
@@ -428,3 +421,78 @@ After publishing and pulling the new Disk Status Page image on the NAS,
 merge the two monitor lines from the example into Homepage's services.yaml
 on debian-docker and reload Homepage. This is an app/config update, with no
 Ansible or Compose changes needed.
+
+
+## Homepage text colors (v2.5.0)
+
+The service example now includes `id: disk-status-summary` and
+`id: disk-status-details`. Add these immediately under the corresponding
+service names in the live services.yaml. They let the styling target only
+these two cards, leaving other widgets and native site-monitor dots alone.
+
+After publishing these files, run on **debian-docker**:
+
+```bash
+cd /opt/docker/homepage
+base=https://raw.githubusercontent.com/blakdav
+base+=/disk-status-page/main/examples/homepage
+python3 - "$base" <<'PYINSTALL'
+import sys
+from urllib.request import urlretrieve
+urlretrieve(sys.argv[1] + '/install.py', '/tmp/dsp-homepage.py')
+PYINSTALL
+python3 /tmp/dsp-homepage.py
+docker exec homepage node --check /app/config/custom.js
+```
+
+The installer fetches both assets before editing either file, backs up
+existing custom.js/custom.css, and appends/replaces a marked section while
+preserving other customizations. It does not edit services.yaml. Re-running
+it updates the same section rather than appending duplicate scripts. Review
+`/tmp/dsp-homepage.py` before running if desired. No credentials are involved.
+
+Add IDs to your existing YAML:
+
+```yaml
+- Storage:
+    - Disk Status:
+        id: disk-status-summary
+        # Keep your href, siteMonitor, statusStyle and widget settings.
+    - Disk Details:
+        id: disk-status-details
+        # Keep your href, siteMonitor, statusStyle and widget settings.
+```
+
+This is an illustration of where to add IDs, not a replacement for the full
+service definitions. The complete updated example is in
+examples/homepage-services.yaml. Summary labels should be plain Awake,
+Sleeping, Attention and Known issues; remove any prior emoji labels.
+
+Reload Homepage with a hard refresh after updating the files. The supplied
+script colors the list/dynamic-list status text: awake/healthy green,
+sleeping blue, testing purple, attention/stale red, known issues muted amber,
+and unknown neutral. Each part of a description is colored independently.
+Summary counts are also colored; zero attention is green rather than red.
+It observes widget refreshes and reapplies only when text changes; it makes
+no network requests and issues no disk commands. Text is inserted using DOM
+text nodes, without interpreting API values as HTML.
+
+The selectors were checked against the v2.5.0 Custom API component and
+service ID markup. Future Homepage markup changes may require adjusting the
+script. Neither browser rendering nor JavaScript execution could be tested
+in this local environment (no browser/JS runtime); run the Node syntax check
+above and verify a widget refresh after installation. If JavaScript is
+unavailable, statuses remain readable plain text and the independent native
+freshness dot continues to work.
+
+Also publish/pull the Disk Status Page image update on **debian-nas** to
+remove status emoji from API descriptions:
+
+```bash
+cd /opt/docker/disk-status-page
+docker pull ghcr.io/blakdav/disk-status-page:latest
+docker compose up -d
+```
+
+No Ansible or Compose changes are required. Homepage files live in its
+existing config bind mount at /opt/docker/homepage, not inside its image.

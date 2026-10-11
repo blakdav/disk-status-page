@@ -407,13 +407,10 @@ def homepage_status(payload):
         health = ('Needs attention' if disk['needs_attention'] else
                   'Health unknown' if disk['health_unknown'] else
                   'Known issue' if smart.get('known_warnings') else 'Healthy')
-        power_marker = {'awake': '🟢', 'standby': '🔵'}.get(state, '⚪')
-        health_marker = {'Healthy': '🟢', 'Known issue': '🟡',
-                         'Needs attention': '🔴', 'Health unknown': '⚪'}[health]
-        description = f'{power_marker} {state_label} · {health_marker} {health}'
+        description = f'{state_label} · {health}'
         if running:
             current = state == 'awake' and not disk.get('stale')
-            description += ' · ' + ('🟣 Testing' if current else '⚪ Last read: testing')
+            description += ' · ' + ('Testing' if current else 'Last read: testing')
         disks.append({'label': disk['label'], 'serial': disk['serial'],
                       'state': state, 'health': health, 'description': description,
                       'temperature': smart.get('temperature'),
