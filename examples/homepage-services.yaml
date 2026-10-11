@@ -46,3 +46,46 @@
             name: label
             label: description
             limit: 8
+    - SnapRAID Sync:
+        href: http://172.23.24.16:8088
+        siteMonitor: http://172.23.24.16:8088/healthz
+        statusStyle: dot
+        widget:
+          type: customapi
+          url: http://172.23.24.16:8088/api/homepage
+          refreshInterval: 30000
+          display: list
+          mappings:
+            - field: snapraid.state_label
+              label: Sync
+              format: text
+            - field: snapraid.finished_label
+              label: Last finished
+              format: text
+            - field: snapraid.result_label
+              label: Last result
+              format: text
+            - field: schedules.sync.label
+              label: Sync schedule
+              format: text
+            - field: schedules.scrub.label
+              label: Scrub schedule
+              format: text
+    - Pool Capacity:
+        href: http://172.23.24.16:8088
+        siteMonitor: http://172.23.24.16:8088/healthz
+        statusStyle: dot
+        widget:
+          type: customapi
+          url: http://172.23.24.16:8088/api/homepage
+          refreshInterval: 30000
+          mappings:
+            - field: pool.used_label
+              label: Used
+              format: text
+            - field: pool.free_label
+              label: Free
+              format: text
+            - field: pool.available_label
+              label: Available
+              format: text

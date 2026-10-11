@@ -421,3 +421,76 @@ After publishing and pulling the new Disk Status Page image on the NAS,
 merge the two monitor lines from the example into Homepage's services.yaml
 on debian-docker and reload Homepage. This is an app/config update, with no
 Ansible or Compose changes needed.
+
+### SnapRAID sync status
+
+The dashboard and `/api/homepage` expose `snapraid.state_label`,
+`snapraid.finished_label` (Pacific time), and `snapraid.result_label`.
+Last-finished/result describe the previous completed run while a new run is
+running. This records service execution success, not a scrub result or proof
+that every file currently has up-to-date parity. No SnapRAID disk queries are
+issued by the dashboard.
+
+First apply the companion homelab changes on your Ansible control node:
+
+```sh
+cd /root/homelab && git pull && cd ansible
+ansible-playbook nas.yml --tags snapraid_status_setup
+```
+
+Ansible installs a small lifecycle recorder and start/finish hooks on
+`snapraid-sync.service`. It reloads systemd without starting or restarting a
+sync. The root-owned JSON record is on the NAS OS disk in
+`/opt/docker/disk-status-page/status/snapraid`; the directory is readable by the container
+through a read-only bind. No background exporter is needed. Copy the new
+bind mounts from this repository's `docker-compose.yml` into your NAS Compose
+file, preserving any local network configuration, then deploy:
+
+```sh
+cd /opt/docker/disk-status-page
+docker compose pull
+docker compose up -d
+```
+
+Image: `ghcr.io/blakdav/disk-status-page:latest` (public; no registry login
+required). Commit-specific images are `ghcr.io/blakdav/disk-status-page:sha-<full-commit>`.
+
+History starts with the next service run after installation; older runs are
+not reconstructed. Runs started directly with `snapraid sync` are not tracked.
+For a manual run that should be recorded, use `systemctl start
+snapraid-sync.service` on the NAS. An already-running sync at installation may
+have no recorded start. A NAS reboot during a recorded run is shown as
+interrupted, without inventing a completion time. If the record or boot identity
+cannot be read, the current state is unavailable. The Homepage health dot checks
+the disk collector; it does not mean that the last sync succeeded.
+
+Merge the **SnapRAID Sync** entry in `examples/homepage-services.yaml` into
+Homepage's existing Storage group. Its API refresh interval is 30 seconds;
+no custom CSS or JavaScript is needed.
+
+
+### Capacity and schedules
+
+The page reads the installed sync and scrub timer definitions through a
+read-only `/etc/systemd/system` mount. Those definitions show the configured
+schedule; they do not confirm that a timer is enabled or predict a delayed
+catch-up run. Timer overrides in drop-in files are not interpreted.
+
+Read-only binds of `/mnt/disks` and `/mnt/pool` expose filesystem counters.
+No directory traversal, `du`, disk mounting, or filesystem writes are used.
+Mounted disks are sampled only while observed awake; sleeping disks retain
+previous measurements. Unmounted spares have no filesystem usage measurement.
+The pool is sampled when all configured Pool data disks are awake; otherwise
+its last measurement is retained, with its measurement time displayed. Keep
+inventory Pool data roles accurate when changing mergerfs membership.
+
+Used space is total minus free; available space excludes reserved blocks.
+Values display TiB (binary units). Mergerfs availability is an aggregate, not
+maximum single-file size or a guarantee that create policy permits a write.
+The 50G minimum-free-space policy still applies. Mount propagation exposes
+new child disk mounts; recreate the container after replacing the pool mount.
+Do not deploy capacity binds until the NAS pool is mounted.
+
+Host helper scripts now live in `/opt/docker/disk-status-page/host`, with their
+records in `/opt/docker/disk-status-page/status/snapraid`. NVMe history remains
+in `/mnt/vault/apps/disk-status-page`.

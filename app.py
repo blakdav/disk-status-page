@@ -56,6 +56,7 @@ def initialize():
     DB.parent.mkdir(parents=True, exist_ok=True)
     with connect() as db:
         db.execute('PRAGMA journal_mode=WAL')
+        db.execute('CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, payload TEXT NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS disks '
                    '(serial TEXT PRIMARY KEY, payload TEXT NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS events '
@@ -167,7 +168,7 @@ def collect(config, previous, now, force_smart=False):
             disk['io'] = {'reads': int(values[0]), 'writes': int(values[4])}
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         disk['error'] = str(exc)
-    return disk
+    return refresh_capacity(config, disk, now)
 
 
 def latest_extended_entry(smart):
@@ -349,6 +350,110 @@ def acknowledge_warning(serial, attribute_id, expected_raw, clear=False):
     return 'Current value acknowledged; increases will need attention again.'
 
 
+def snapraid_status():
+    """Read service lifecycle metadata only; never query the array."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    result = {'state': 'unknown', 'state_label': 'Not recorded',
+              'last_result': None, 'result_label': 'Not recorded',
+              'finished_at': None, 'finished_label': 'Not recorded'}
+    try:
+        raw = json.loads(Path('/host/snapraid/sync.json').read_text())
+        if not isinstance(raw, dict) or raw.get('state') not in ('running', 'idle'):
+            raise ValueError('Invalid sync record')
+        for key in ('started_at', 'finished_at', 'last_success_at'):
+            value = raw.get(key)
+            if value is not None and (not isinstance(value, (int, float)) or
+                                      not 0 < value <= time.time() + 5):
+                raise ValueError('Invalid sync timestamp')
+        result.update(raw)
+        if raw['state'] == 'running':
+            boot = Path('/host/boot_id').read_text().strip()
+            if not boot or boot != raw.get('boot_id'):
+                result.update(state='interrupted', state_label='Interrupted by reboot')
+            else:
+                result['state_label'] = 'Running'
+        else:
+            result['state_label'] = 'Idle'
+        last = raw.get('last_result')
+        result['result_label'] = ('Succeeded' if last == 'success' else
+                                  'Not recorded' if last is None else f'Failed: {last}')
+        if raw.get('finished_at'):
+            result['finished_label'] = datetime.fromtimestamp(
+                raw['finished_at'], ZoneInfo('America/Los_Angeles')).strftime('%b %d, %Y %I:%M %p %Z')
+    except (OSError, ValueError, TypeError, OverflowError):
+        # Preserve historical information but never report an unverified run.
+        result.update(state='unknown', state_label='Status unavailable')
+    return result
+
+
+def snapraid_schedules():
+    schedules = {}
+    for kind in ('sync', 'scrub'):
+        try:
+            text = Path(f'/host/systemd/snapraid-{kind}.timer').read_text()
+            calendars = re.findall(r'^OnCalendar=(.+)$', text, re.MULTILINE)
+            labels = {'*-*-* 03:30:00 America/Los_Angeles': 'Daily at 3:30 AM Pacific',
+                      '*-*-01 05:00:00 America/Los_Angeles': 'First of each month at 5:00 AM Pacific'}
+            schedules[kind] = {'calendar': calendars,
+                               'label': '; '.join(labels.get(c, c) for c in calendars) or 'Not configured'}
+        except OSError:
+            schedules[kind] = {'calendar': [], 'label': 'Unavailable'}
+    return schedules
+
+
+def filesystem_capacity(path, now):
+    # Reject an absent mount: never accidentally report the container OS disk.
+    if not os.path.ismount(path):
+        return {'status': 'unmounted'}
+    try:
+        stat = os.statvfs(path)
+        return {'status': 'available', 'observed_at': now,
+                'total_bytes': stat.f_blocks * stat.f_frsize,
+                'used_bytes': (stat.f_blocks - stat.f_bfree) * stat.f_frsize,
+                'free_bytes': stat.f_bfree * stat.f_frsize,
+                'available_bytes': stat.f_bavail * stat.f_frsize}
+    except OSError as exc:
+        return {'status': 'unavailable', 'error': str(exc)}
+
+
+def refresh_capacity(config, disk, now):
+    label = config.get('label', '')
+    if not re.fullmatch(r'[a-zA-Z0-9_-]+', label):
+        return disk
+    path = '/host/disks/' + label
+    if not os.path.ismount(path):
+        disk['capacity'] = {'status': 'unmounted'}
+    elif disk['state'] == 'awake':
+        disk['capacity'] = filesystem_capacity(path, now)
+    # Sleeping disks retain their previous capacity without filesystem calls.
+    return disk
+
+
+def pool_capacity(disks, now):
+    with connect() as db:
+        row = db.execute("SELECT payload FROM metadata WHERE name='pool_capacity'").fetchone()
+    result = json.loads(row[0]) if row else {'status': 'not_collected'}
+    if not os.path.ismount('/host/pool'):
+        return {'status': 'unmounted'}
+    result['cached'] = now - result.get('observed_at', 0) > INTERVAL * 2
+    for key in ('total', 'used', 'free', 'available'):
+        value = result.get(key + '_bytes')
+        result[key + '_label'] = f'{value / 2 ** 40:.2f} TiB' if value is not None else 'Unavailable'
+    return result
+
+
+def refresh_pool_capacity(disks, now):
+    branches = [d for d in disks if d.get('role') == 'Pool data']
+    # Conservatively skip mergerfs statfs while a configured member is asleep.
+    if not branches or any(d.get('state') != 'awake' for d in branches):
+        return
+    result = filesystem_capacity('/host/pool', now)
+    with connect() as db:
+        db.execute("INSERT INTO metadata VALUES ('pool_capacity', ?) "
+                   "ON CONFLICT(name) DO UPDATE SET payload=excluded.payload", (json.dumps(result),))
+
+
 def snapshot():
     disks = stored()
     now = time.time()
@@ -368,7 +473,8 @@ def snapshot():
         disk['extended_test'] = extended_tests.get(serial, {})
     return {'demo': DEMO, 'poll_seconds': INTERVAL, 'smart_seconds': SMART_INTERVAL,
             'server_time': now, 'disks': [decorate_disk(d, acknowledgements, now) for d in disks.values()], 'events': events,
-            'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN) and not DEMO}
+            'schedules': snapraid_schedules(), 'pool': pool_capacity(list(disks.values()), now),
+            'snapraid': snapraid_status(), 'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN) and not DEMO}
 
 
 def collector_freshness(payload):
@@ -417,8 +523,11 @@ def homepage_status(payload):
                       'health_read_at': disk.get('smart_at'),
                       'observed_at': disk.get('observed_at'),
                       'extended_test': disk.get('extended_test', {}),
+                      'capacity': disk.get('capacity', {}),
                       'needs_attention': disk['needs_attention']})
     return {'demo': payload['demo'], 'summary': summary, 'disks': disks,
+            'snapraid': payload.get('snapraid', {}),
+            'schedules': payload.get('schedules', {}), 'pool': payload.get('pool', {}),
             'freshness': collector_freshness(payload),
             'generated_at': payload['server_time']}
 
@@ -594,6 +703,8 @@ def run_collector(configs):
                 else:
                     disk = collect(config, old, time.time())
                 save(disk, old)
+            if not DEMO:
+                refresh_pool_capacity(list(stored().values()), time.time())
             next_poll = time.monotonic() + INTERVAL
 
 

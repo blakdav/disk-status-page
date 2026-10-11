@@ -30,6 +30,41 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # Atomic lifecycle records from the Ansible-managed systemd sync hooks.
+      - type: bind
+        source: /opt/docker/disk-status-page/status/snapraid
+        target: /host/snapraid
+        read_only: true
+        bind:
+          create_host_path: false
+      # Detect a run interrupted by NAS reboot instead of showing Running forever.
+      - type: bind
+        source: /proc/sys/kernel/random/boot_id
+        target: /host/boot_id
+        read_only: true
+        bind:
+          create_host_path: false
+      # Read filesystem totals without exposing writable data paths.
+      - type: bind
+        source: /mnt/disks
+        target: /host/disks
+        read_only: true
+        bind:
+          propagation: rslave
+          create_host_path: false
+      - type: bind
+        source: /mnt/pool
+        target: /host/pool
+        read_only: true
+        bind:
+          create_host_path: false
+      # Display the installed timer definitions rather than a hardcoded schedule.
+      - type: bind
+        source: /etc/systemd/system
+        target: /host/systemd
+        read_only: true
+        bind:
+          create_host_path: false
     logging:
       driver: json-file
       options:
