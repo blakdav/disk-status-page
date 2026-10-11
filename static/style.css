@@ -2,3 +2,14 @@
 .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:flex-end}button{font:inherit;font-size:12px;background:#294234;color:#e5eee9;border:1px solid #52735e;border-radius:7px;padding:9px 12px;cursor:pointer}button:hover:enabled{background:#3a5945}button:disabled{opacity:.4;cursor:default}button:focus-visible{outline:2px solid #b4e5a5;outline-offset:3px}.disk-actions{display:flex;gap:8px;flex-wrap:wrap;margin:15px 0}.test-status,#action-status{font-size:12px;color:#b4cfbd}#action-status{min-height:20px;overflow-wrap:anywhere}
 
 .known-issue{font-size:12px;color:#a5b8ad;border-left:2px solid #526e5d;padding-left:12px;margin:14px 0}.known-issue p,.warning p{margin-bottom:8px}.known-issue button,.warning button{font-size:11px;padding:6px 9px}
+
+/* Keep storage labels next to their values instead of spanning the viewport. */
+.storage-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:28px;margin-bottom:30px}
+.storage-panels .history{min-width:0;margin-top:0}
+.storage-panels dl{display:grid;grid-template-columns:minmax(8rem,11rem) minmax(0,1fr);gap:12px 18px;margin:18px 0}
+.storage-panels dl>div{display:contents}
+.storage-panels dt,.storage-panels dd{font-size:13px;overflow-wrap:anywhere}
+.storage-panels dd{text-align:left;font-variant-numeric:tabular-nums}
+.storage-panels p{overflow-wrap:anywhere}
+@media(max-width:850px){.storage-panels{grid-template-columns:1fr;gap:20px}.storage-panels dl{max-width:38rem}}
+@media(max-width:380px){.storage-panels dl{grid-template-columns:minmax(0,1fr);gap:4px}.storage-panels dd{margin-bottom:12px}}

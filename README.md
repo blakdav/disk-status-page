@@ -280,8 +280,8 @@ Homepage configuration.
 
 Merge [examples/homepage-services.yaml](examples/homepage-services.yaml)
 into Homepage's `services.yaml` on debian-docker. It provides a native
-summary card plus an optional dynamic disk list, without an iframe or a
-custom Homepage image. Keep your existing groups and replace the card's
+summary card, compact disk list, SnapRAID status/schedules, and pool capacity,
+without an iframe or a custom Homepage image. Keep your existing groups and replace the card's
 `href` with your NPM HTTPS address. The widget's API URL can remain the
 internal NAS address `http://172.23.24.16:8088/api/homepage`.
 
@@ -387,6 +387,15 @@ No Compose or Ansible changes are needed. The existing GHCR workflow still
 publishes `latest` and a full-commit-specific tag. New tracking code has unit
 test coverage; live NAS and browser verification remain pending deployment.
 
+
+Homepage disk descriptions show only power state and unacknowledged issues,
+for example `Sleeping`, `Awake`, or `Awake · Reallocated_Sector_Ct: 201`.
+Healthy labels, acknowledged warnings, and self-test progress are omitted
+from the compact list; full details remain in Disk Status Page. Stale or
+unknown disk state remains visible. Pool Capacity includes total, used, free,
+and available space. Merge the example cards under the existing Storage
+group in `/opt/docker/homepage/services.yaml` on debian-docker, replacing
+existing cards of the same name to avoid duplicates.
 
 Homepage disk descriptions use plain text. Only the native freshness dot
 and optional Data freshness field use color. No custom styling files or

@@ -27,11 +27,9 @@
             - field: summary.attention
               label: "Attention"
               format: number
-            - field: summary.known_issues
-              label: "Known issues"
-              format: number
     # Optional detailed panel; requires a Homepage version supporting
-    # Custom API dynamic-list. This lists every configured disk separately.
+    # Custom API dynamic-list. Only power state and unacknowledged issues
+    # appear in each row; healthy/acknowledged labels are omitted.
     - Disk Details:
         href: http://172.23.24.16:8088
         siteMonitor: http://172.23.24.16:8088/healthz
@@ -80,6 +78,9 @@
           url: http://172.23.24.16:8088/api/homepage
           refreshInterval: 30000
           mappings:
+            - field: pool.total_label
+              label: Total
+              format: text
             - field: pool.used_label
               label: Used
               format: text

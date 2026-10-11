@@ -350,25 +350,25 @@ class HomepageAndAcknowledgementTests(unittest.TestCase):
                 self.assertEqual([d['label'] for d in app.homepage_status(payload)['disks']],
                                  ['data1', 'data2', 'parity1', 'data6'])
 
-    def test_homepage_plain_text_keeps_power_health_and_testing_separate(self):
+    def test_homepage_details_only_show_state_and_unacknowledged_issues(self):
         import time
         disk = self.disk()
+        result = app.homepage_status(app.snapshot())['disks'][0]
+        self.assertIn('Reallocated_Sector_Ct', result['description'])
         app.acknowledge_warning('test', 5, 200)
-        description = app.homepage_status(app.snapshot())['disks'][0]['description']
-        self.assertIn('Sleeping', description)
-        self.assertIn('Known issue', description)
+        result = app.homepage_status(app.snapshot())['disks'][0]
+        self.assertEqual(result['description'], 'Sleeping')
+        self.assertEqual(result['unacknowledged_issues'], [])
         disk.update(state='awake', smart_at=time.time())
         disk['smart']['test_status'] = {'value': 249}
         app.save(disk, {})
-        description = app.homepage_status(app.snapshot())['disks'][0]['description']
-        self.assertIn('Awake', description)
-        self.assertIn('Testing', description)
-        disk['state'] = 'standby'
+        self.assertEqual(app.homepage_status(app.snapshot())['disks'][0]['description'], 'Awake')
+        # A rising acknowledged counter must reappear as an active issue.
+        disk['smart']['issues'][0]['raw'] = 201
         app.save(disk, {})
-        description = app.homepage_status(app.snapshot())['disks'][0]['description']
-        self.assertIn('Last read: testing', description)
-        self.assertNotIn(' · Testing', description)
-        self.assertFalse(any(marker in description for marker in ['🟢', '🔵', '🟣', '🟡', '⚪']))
+        result = app.homepage_status(app.snapshot())['disks'][0]
+        self.assertIn('Reallocated_Sector_Ct', result['description'])
+        self.assertTrue(result['unacknowledged_issues'])
 
     def test_homepage_endpoint_returns_native_panel_shape(self):
         import io, json

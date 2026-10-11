@@ -538,12 +538,23 @@ def homepage_status(payload):
         health = ('Needs attention' if disk['needs_attention'] else
                   'Health unknown' if disk['health_unknown'] else
                   'Known issue' if smart.get('known_warnings') else 'Healthy')
-        description = f'{state_label} · {health}'
-        if running:
-            current = state == 'awake' and not disk.get('stale')
-            description += ' · ' + ('Testing' if current else 'Last read: testing')
+        # Homepage stays quiet for healthy disks and acknowledged warnings.
+        # Keep health/testing details in structured fields and the full dashboard.
+        attention = []
+        if disk.get('error'):
+            attention.append(disk['error'])
+        if smart.get('passed') is False:
+            attention.append('SMART health failed')
+        attention.extend(smart.get('active_warnings') or [])
+        if disk['needs_attention'] and not attention and state not in ('stale', 'unknown'):
+            attention.append('Needs attention')
+        attention = list(dict.fromkeys(attention))
+        description = state_label
+        if attention:
+            description += ' · ' + '; '.join(attention)
         disks.append({'label': disk['label'], 'serial': disk['serial'],
                       'state': state, 'health': health, 'description': description,
+                      'unacknowledged_issues': attention,
                       'temperature': smart.get('temperature'),
                       'health_read_at': disk.get('smart_at'),
                       'observed_at': disk.get('observed_at'),
