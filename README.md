@@ -158,7 +158,7 @@ smartd; host background monitoring remains separate from this container.
 
 ## Current validation
 
-Seventeen unit tests pass, covering sleeping/unknown states, standby races,
+Twenty-six unit tests pass, covering sleeping/unknown states, standby races,
 unsupported SMART power checks, health warning bits, persisted transitions,
 observation gaps, and HTTP responses tested without sockets. Python compiles,
 YAML parses, and `docker compose config --quiet` passes. This development
@@ -245,3 +245,72 @@ in the same NVMe directory. The GitHub Actions workflow still publishes
 `latest` and `sha-<full-commit-sha>` using `GITHUB_TOKEN` with
 `contents: read` and `packages: write`. Private GHCR authentication, if
 applicable, is described above.
+
+## Homepage native panels and acknowledged warnings
+
+`GET /api/homepage` returns cached summary counts and per-disk descriptions.
+Homepage requests never query hardware, wake disks or initiate actions. This
+read-only endpoint needs no action token; do not put the control token in
+Homepage configuration.
+
+Merge [examples/homepage-services.yaml](examples/homepage-services.yaml)
+into Homepage's `services.yaml` on debian-docker. It provides a native
+summary card plus an optional dynamic disk list, without an iframe or a
+custom Homepage image. Keep your existing groups and replace the card's
+`href` with your NPM HTTPS address. The widget's API URL can remain the
+internal NAS address `http://172.23.24.16:8088/api/homepage`.
+
+The example uses Homepage's documented Custom API mappings and dynamic-list
+mode. The detailed list requires a Homepage version that supports that
+mode; the summary uses ordinary numeric fields. Homepage must be able to
+reach the NAS on port 8088. See the
+[Custom API documentation](https://gethomepage.dev/widgets/services/customapi/).
+The example has not yet been applied to your live Homepage configuration.
+
+Summary fields include `total`, `awake`, `sleeping`, `unknown`, `attention`,
+`known_issues`, `health_unknown`, `tests_running`, and `stale`. Counts refer
+to disks, not numbers of warnings. Stale state is never counted as awake or
+sleeping. A disk that has never provided health data is marked health
+unknown rather than failed. The detailed panel makes that distinction
+visible. Stale/unreachable state and collector errors still need attention.
+Cached temperature and test status describe the last health read, not a
+fresh measurement. No-data configured disks appear unknown until collected.
+
+To acknowledge an existing cumulative SMART warning:
+
+1. Unlock controls in Disk Status Page.
+2. Review the warning's raw value and choose **Acknowledge current value**.
+3. Confirm. The warning becomes **Known issue · unchanged**, visible in
+   details and the known-issues count but excluded from the attention count.
+
+Acknowledgements are saved in the existing SQLite database, keyed by disk
+serial and attribute ID. A higher raw count needs attention again and shows
+the increase over the acknowledged baseline. An **Undo acknowledgement**
+button restores ordinary warning treatment. The action only updates the
+app's database; it never clears or modifies the drive's SMART records.
+The browser sends the displayed raw value, and the server rejects an
+acknowledgement if that value changed before the action was processed.
+
+Acknowledgement is allowed for cumulative counters 5 (reallocated sectors),
+187 (reported uncorrectable), 188 (command timeout), and 199 (CRC errors).
+It does not suppress current pending/unreadable-sector warnings, overall
+SMART failure, manufacturer threshold failure flags, failed self-tests or
+error-log warnings. A known issue does not establish that a disk is healthy.
+Older cached warnings remain visible after upgrade; unclassified legacy
+warnings stay active until replaced by the next successful health read.
+
+This update adds a table automatically without changing existing history.
+No Compose or Ansible changes are required relative to the disk-controls
+version. After committing/pushing and waiting for Actions to publish, run
+on debian-nas:
+
+```bash
+cd /opt/docker/disk-status-page
+docker pull ghcr.io/blakdav/disk-status-page:latest
+docker compose up -d
+```
+
+Then add the Homepage example to the existing Homepage configuration.
+The GHCR workflow continues to publish `latest` and a commit-specific
+`sha-<full-commit-sha>` tag. If the package is private, authenticate on the
+NAS as described under Publishing before pulling.

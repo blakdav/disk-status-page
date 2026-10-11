@@ -24,6 +24,8 @@ STOP = threading.Event()
 DB = Path(os.getenv('DATA_DIR', '/data')) / 'history.sqlite3'
 WARNINGS = {5, 187, 188, 197, 198, 199}
 COUNTERS = {4, 12, 193}
+# Acknowledge cumulative counters, never current pending/unreadable sectors.
+ACKNOWLEDGEABLE = {5, 187, 188, 199}
 CONFIGS = []
 ACTION_TOKEN = ''
 JOBS = queue.Queue(maxsize=1)
@@ -59,6 +61,9 @@ def initialize():
         db.execute('CREATE TABLE IF NOT EXISTS events '
                    '(serial TEXT, observed_at REAL, state TEXT)')
         db.execute('CREATE INDEX IF NOT EXISTS event_time ON events(observed_at)')
+        db.execute('CREATE TABLE IF NOT EXISTS acknowledgements '
+                   '(serial TEXT, attribute_id INTEGER, baseline INTEGER, '
+                   'acknowledged_at REAL, PRIMARY KEY(serial, attribute_id))')
 
 
 def command(args):
@@ -81,26 +86,45 @@ def power_state(output):
 def summarize_smart(data, status):
     attrs = data.get('ata_smart_attributes', {}).get('table', [])
     warnings = []
+    issues = []
     counters = {}
     for attr in attrs:
         raw = attr.get('raw', {}).get('value', 0)
         if attr.get('id') in WARNINGS and raw:
-            warnings.append(f"{attr['name']}: {attr.get('raw', {}).get('string', raw)}")
+            message = f"{attr['name']}: {attr.get('raw', {}).get('string', raw)}"
+            warnings.append(message)
+            issues.append({'key': f"attribute:{attr['id']}", 'attribute_id': attr['id'],
+                           'raw': raw, 'message': message,
+                           'acknowledgeable': attr['id'] in ACKNOWLEDGEABLE})
         if attr.get('id') in COUNTERS:
             counters[attr['name']] = raw
     passed = data.get('smart_status', {}).get('passed')
     errors = data.get('ata_smart_error_log', {}).get('summary', {}).get('count', 0)
     if errors:
-        warnings.append(f'{errors} recorded SMART errors (may be historical)')
+        message = f'{errors} recorded SMART errors (may be historical)'
+        warnings.append(message)
+        issues.append({'key': 'error-log', 'message': message})
     # The self-test count includes successful tests; inspect individual results.
     for test in data.get('ata_smart_self_test_log', {}).get('standard', {}).get('table', []):
         result = test.get('status', {})
         if result.get('passed') is False:
-            warnings.append('Self-test: ' + result.get('string', 'failed'))
-    if status & 0b11111000:
-        warnings.append('SMART reports a health, attribute, error-log or self-test warning')
+            message = 'Self-test: ' + result.get('string', 'failed')
+            warnings.append(message)
+            issues.append({'key': 'self-test', 'message': message})
+    # Keep threshold failures separate from raw counts: acknowledging a count
+    # must never suppress SMART's own current/past attribute failure flags.
+    for bit, key, message in (
+        (3, 'health-failure', 'SMART overall health failure'),
+        (4, 'threshold', 'A SMART attribute is at or below its failure threshold'),
+        (5, 'past-threshold', 'A SMART attribute previously crossed its failure threshold'),
+        (6, 'error-log-flag', 'SMART error log contains recorded errors'),
+        (7, 'self-test-flag', 'SMART self-test log contains recorded failures'),
+    ):
+        if status & (1 << bit):
+            warnings.append(message)
+            issues.append({'key': key, 'message': message})
     return {'passed': passed, 'temperature': data.get('temperature', {}).get('current'),
-            'warnings': warnings, 'counters': counters,
+            'warnings': warnings, 'issues': issues, 'counters': counters,
             'error_log': data.get('ata_smart_error_log', {}),
             'self_test_log': data.get('ata_smart_self_test_log', {}),
             'attributes': attrs,
@@ -165,15 +189,123 @@ def stored():
         return {serial: json.loads(payload) for serial, payload in db.execute('SELECT * FROM disks')}
 
 
+def warning_issues(smart):
+    if 'issues' in smart:
+        return smart['issues']
+    # Older caches remain readable without waking sleeping disks on upgrade.
+    # Preserve unclassified legacy warnings rather than guessing them away.
+    attributes = smart.get('attributes', [])
+    result = []
+    for index, message in enumerate(smart.get('warnings', [])):
+        attr = next((a for a in attributes if message.startswith(a.get('name', '') + ':')), None)
+        if attr:
+            result.append({'key': f"attribute:{attr['id']}", 'attribute_id': attr['id'],
+                           'raw': attr.get('raw', {}).get('value'), 'message': message,
+                           'acknowledgeable': attr['id'] in ACKNOWLEDGEABLE})
+        else:
+            result.append({'key': f'legacy:{index}', 'message': message})
+    return result
+
+
+def decorate_disk(disk, acknowledgements, now):
+    disk = dict(disk)
+    smart = dict(disk.get('smart') or {})
+    issues = []
+    for original in warning_issues(smart):
+        issue = dict(original)
+        baseline = acknowledgements.get((disk['serial'], issue.get('attribute_id')))
+        raw = issue.get('raw')
+        issue['acknowledged'] = bool(issue.get('acknowledgeable') and baseline
+                                     and isinstance(raw, int) and raw <= baseline['baseline'])
+        if baseline:
+            issue['baseline'] = baseline['baseline']
+            issue['acknowledged_at'] = baseline['acknowledged_at']
+            issue['increased_by'] = max(0, raw - baseline['baseline']) if isinstance(raw, int) else 0
+        issues.append(issue)
+    smart['issues'] = issues
+    smart['active_warnings'] = [i['message'] for i in issues if not i['acknowledged']]
+    smart['known_warnings'] = [i['message'] for i in issues if i['acknowledged']]
+    disk['smart'] = smart
+    disk['stale'] = now - disk.get('observed_at', 0) > INTERVAL * 2.5
+    disk['needs_attention'] = bool(disk['stale'] or disk.get('error')
+                                   or disk.get('state') not in ('awake', 'standby')
+                                   or smart.get('passed') is False or smart['active_warnings'])
+    disk['health_unknown'] = smart.get('passed') is None
+    return disk
+
+
+def acknowledge_warning(serial, attribute_id, expected_raw, clear=False):
+    if isinstance(attribute_id, bool) or attribute_id not in ACKNOWLEDGEABLE:
+        raise ValueError('Only cumulative warning counters can be acknowledged')
+    if clear:
+        with connect() as db:
+            db.execute('DELETE FROM acknowledgements WHERE serial = ? AND attribute_id = ?',
+                       (serial, attribute_id))
+        return 'Acknowledgement removed; disk information updated.'
+    disk = stored().get(serial)
+    if not disk:
+        raise ValueError('No collected information for this disk')
+    issue = next((i for i in warning_issues(disk.get('smart') or {})
+                  if i.get('attribute_id') == attribute_id), None)
+    if (not issue or not isinstance(issue.get('raw'), int)
+            or isinstance(expected_raw, bool) or not isinstance(expected_raw, int)
+            or issue['raw'] != expected_raw):
+        raise ValueError('Warning changed or is unavailable; refresh and review it first')
+    with connect() as db:
+        db.execute('INSERT OR REPLACE INTO acknowledgements VALUES (?, ?, ?, ?)',
+                   (serial, attribute_id, issue['raw'], time.time()))
+    return 'Current value acknowledged; increases will need attention again.'
+
+
 def snapshot():
     disks = stored()
+    now = time.time()
+    if CONFIGS:
+        disks = {c['serial']: disks.get(c['serial'], {
+            **c, 'state': 'unknown', 'observed_at': 0,
+            'error': 'Awaiting first observation'}) for c in CONFIGS}
     with connect() as db:
+        acknowledgements = {(s, a): {"baseline": b, "acknowledged_at": t}
+                            for s, a, b, t in db.execute("SELECT * FROM acknowledgements")}
         events = [{'serial': s, 'observed_at': t, 'state': state}
                   for s, t, state in db.execute(
                       'SELECT * FROM events ORDER BY observed_at DESC LIMIT 100')]
     return {'demo': DEMO, 'poll_seconds': INTERVAL, 'smart_seconds': SMART_INTERVAL,
-            'server_time': time.time(), 'disks': list(disks.values()), 'events': events,
+            'server_time': now, 'disks': [decorate_disk(d, acknowledgements, now) for d in disks.values()], 'events': events,
             'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN) and not DEMO}
+
+
+def homepage_status(payload):
+    summary = {'total': len(payload['disks']), 'awake': 0, 'sleeping': 0,
+               'unknown': 0, 'attention': 0, 'known_issues': 0, 'health_unknown': 0,
+               'tests_running': 0, 'stale': 0}
+    disks = []
+    for disk in payload['disks']:
+        state = 'stale' if disk.get('stale') else disk.get('state', 'unknown')
+        state_label = {'awake': 'Awake', 'standby': 'Sleeping', 'unknown': 'Unknown', 'stale': 'Stale'}.get(state, 'Unknown')
+        summary[{'awake': 'awake', 'standby': 'sleeping'}.get(state, 'unknown')] += 1
+        summary['stale'] += int(bool(disk.get('stale')))
+        summary['attention'] += int(disk['needs_attention'])
+        smart = disk.get('smart') or {}
+        summary['known_issues'] += int(bool(smart.get('known_warnings')))
+        summary['health_unknown'] += int(disk['health_unknown'])
+        value = smart.get('test_status', {}).get('value')
+        running = isinstance(value, int) and value & 0xf0 == 0xf0
+        summary['tests_running'] += int(running and not disk.get('stale') and state == 'awake')
+        health = ('Needs attention' if disk['needs_attention'] else
+                  'Health unknown' if disk['health_unknown'] else
+                  'Known issue' if smart.get('known_warnings') else 'Healthy')
+        description = state_label + ' · ' + health
+        if running:
+            description += ' · ' + ('Last read: testing' if state != 'awake' else 'Testing')
+        disks.append({'label': disk['label'], 'serial': disk['serial'],
+                      'state': state, 'health': health, 'description': description,
+                      'temperature': smart.get('temperature'),
+                      'health_read_at': disk.get('smart_at'),
+                      'observed_at': disk.get('observed_at'),
+                      'needs_attention': disk['needs_attention']})
+    return {'demo': payload['demo'], 'summary': summary, 'disks': disks,
+            'generated_at': payload['server_time']}
 
 
 def job_snapshot():
@@ -181,9 +313,9 @@ def job_snapshot():
         return dict(JOB) if JOB else None
 
 
-def submit_job(action, serial=None, wake=False):
+def submit_job(action, serial=None, wake=False, attribute_id=None, expected_raw=None):
     global JOB
-    if action not in ('refresh', 'spin-up', 'spin-down', 'health', 'test'):
+    if action not in ('refresh', 'spin-up', 'spin-down', 'health', 'test', 'acknowledge', 'unacknowledge'):
         raise ValueError('Unknown action')
     if action != 'refresh' and serial not in {c['serial'] for c in CONFIGS}:
         raise ValueError('Unknown disk serial')
@@ -191,7 +323,8 @@ def submit_job(action, serial=None, wake=False):
         if JOB and JOB['state'] in ('queued', 'running'):
             raise ValueError('An action is already running; please wait')
         JOB = {'id': secrets.token_hex(8), 'action': action, 'serial': serial,
-               'state': 'queued', 'message': 'Queued', 'wake': wake}
+               'state': 'queued', 'message': 'Queued', 'wake': wake,
+               'attribute_id': attribute_id, 'expected_raw': expected_raw}
         JOBS.put_nowait(dict(JOB))
         return dict(JOB)
 
@@ -243,6 +376,9 @@ def test_running(data):
 
 
 def execute_job(job):
+    if job['action'] in ('acknowledge', 'unacknowledge'):
+        return acknowledge_warning(job['serial'], job.get('attribute_id'),
+                                   job.get('expected_raw'), job['action'] == 'unacknowledge')
     if job['action'] == 'refresh':
         errors = []
         for config in CONFIGS:
@@ -367,7 +503,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise ValueError('Object required')
-            job = submit_job(body.get('action'), body.get('serial'), body.get('wake') is True)
+            job = submit_job(body.get('action'), body.get('serial'), body.get('wake') is True,
+                             body.get('attribute_id'), body.get('expected_raw'))
             self.respond_json(202, job)
         except (ValueError, TypeError) as exc:
             self.respond_json(400, {'error': str(exc)})
@@ -383,7 +520,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split('?')[0]
-        if path in ('/api/status', '/healthz'):
+        if path in ('/api/status', '/api/homepage', '/healthz'):
             payload = snapshot()
             if path == '/healthz':
                 fresh = any(payload['server_time'] - d['observed_at'] < INTERVAL * 3
@@ -392,7 +529,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps({'collector_recent': fresh}).encode()
             else:
                 self.send_response(200)
-                body = json.dumps(payload).encode()
+                body = json.dumps(homepage_status(payload) if path == '/api/homepage' else payload).encode()
             mime = 'application/json'
         elif path in ('/', '/app.js', '/style.css'):
             file = ROOT / 'static' / ('index.html' if path == '/' else path[1:])

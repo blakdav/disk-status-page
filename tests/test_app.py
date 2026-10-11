@@ -198,5 +198,123 @@ class ActionTests(unittest.TestCase):
             self.assertEqual((Path(directory) / 'action-token').stat().st_mode & 0o777, 0o600)
 
 
+class HomepageAndAcknowledgementTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.patch = patch('app.DB', Path(self.directory.name) / 'history.sqlite3')
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.addCleanup(self.directory.cleanup)
+        app.initialize()
+
+    def disk(self, count=200, serial='test', status=0, extra=None):
+        import time
+        data = {'smart_status': {'passed': True}, 'ata_smart_attributes': {'table': [
+            {'id': 5, 'name': 'Reallocated_Sector_Ct', 'raw': {'value': count, 'string': str(count)}}
+        ]}}
+        if extra:
+            data['ata_smart_attributes']['table'].append(extra)
+        disk = {'serial': serial, 'label': serial, 'state': 'standby',
+                'observed_at': time.time(), 'smart': app.summarize_smart(data, status),
+                'smart_at': time.time()}
+        app.save(disk, {})
+        return disk
+
+    def test_baseline_survives_reinitialization_and_increase_realerts(self):
+        self.disk()
+        app.acknowledge_warning('test', 5, 200)
+        app.initialize()
+        result = app.homepage_status(app.snapshot())
+        self.assertEqual(result['summary']['attention'], 0)
+        self.assertEqual(result['summary']['known_issues'], 1)
+        self.assertEqual(result['disks'][0]['health'], 'Known issue')
+        self.disk(201)
+        result = app.homepage_status(app.snapshot())
+        self.assertEqual(result['summary']['attention'], 1)
+        issue = app.snapshot()['disks'][0]['smart']['issues'][0]
+        self.assertFalse(issue['acknowledged'])
+        self.assertEqual(issue['increased_by'], 1)
+        self.assertEqual(issue['baseline'], 200)
+
+    def test_acknowledgement_is_per_serial_and_can_be_undone(self):
+        self.disk(serial='first')
+        self.disk(serial='second')
+        app.acknowledge_warning('first', 5, 200)
+        self.assertEqual(app.homepage_status(app.snapshot())['summary']['attention'], 1)
+        app.acknowledge_warning('first', 5, None, clear=True)
+        self.assertEqual(app.homepage_status(app.snapshot())['summary']['attention'], 2)
+
+    def test_new_warning_and_smart_threshold_failure_are_not_hidden(self):
+        self.disk()
+        app.acknowledge_warning('test', 5, 200)
+        self.disk(status=16, extra={'id': 197, 'name': 'Current_Pending_Sector', 'raw': {'value': 1}})
+        result = app.snapshot()['disks'][0]
+        self.assertTrue(result['needs_attention'])
+        self.assertEqual(len(result['smart']['known_warnings']), 1)
+        self.assertEqual(len(result['smart']['active_warnings']), 2)
+        with self.assertRaises(ValueError):
+            app.acknowledge_warning('test', 197, 1)
+
+    def test_changed_count_cannot_be_acknowledged_with_old_browser_value(self):
+        self.disk(201)
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            app.acknowledge_warning('test', 5, 200)
+
+    def test_acknowledgement_and_homepage_reads_do_not_issue_commands(self):
+        self.disk()
+        with patch('app.command') as command:
+            app.execute_job({'action': 'acknowledge', 'serial': 'test', 'attribute_id': 5, 'expected_raw': 200})
+            result = app.homepage_status(app.snapshot())
+            command.assert_not_called()
+        self.assertEqual(result['summary']['sleeping'], 1)
+        self.assertEqual(result['summary']['attention'], 0)
+
+    def test_stale_or_missing_state_still_needs_attention(self):
+        disk = self.disk()
+        app.acknowledge_warning('test', 5, 200)
+        disk['observed_at'] = 1
+        app.save(disk, {})
+        result = app.homepage_status(app.snapshot())
+        self.assertEqual(result['summary']['attention'], 1)
+        self.assertEqual(result['summary']['unknown'], 1)
+        self.assertEqual(result['summary']['sleeping'], 0)
+        self.assertEqual(result['disks'][0]['state'], 'stale')
+
+    def test_never_read_health_is_unknown_not_a_failed_disk(self):
+        import time
+        app.save({'serial': 'test', 'label': 'test', 'state': 'standby', 'observed_at': time.time()}, {})
+        result = app.homepage_status(app.snapshot())
+        self.assertEqual(result['summary']['health_unknown'], 1)
+        self.assertEqual(result['summary']['attention'], 0)
+        self.assertEqual(result['disks'][0]['health'], 'Health unknown')
+
+    def test_self_test_failure_and_overall_failure_cannot_be_acknowledged_away(self):
+        disk = self.disk()
+        app.acknowledge_warning('test', 5, 200)
+        disk['smart']['passed'] = False
+        disk['smart']['issues'].append({'key': 'self-test', 'message': 'Self-test failed'})
+        app.save(disk, {})
+        self.assertTrue(app.snapshot()['disks'][0]['needs_attention'])
+
+    def test_homepage_endpoint_returns_native_panel_shape(self):
+        import io, json
+        self.disk()
+        handler = object.__new__(app.Handler)
+        handler.path = '/api/homepage'
+        handler.request_version = 'HTTP/1.1'
+        handler.command = 'GET'
+        handler.requestline = 'GET /api/homepage HTTP/1.1'
+        handler.wfile = io.BytesIO()
+        with patch('app.command') as command:
+            handler.do_GET()
+            command.assert_not_called()
+        raw = handler.wfile.getvalue()
+        self.assertIn(b'200', raw.split(b'\r\n')[0])
+        payload = json.loads(raw.split(b'\r\n\r\n', 1)[1])
+        self.assertEqual(payload['summary']['attention'], 1)
+        self.assertEqual(payload['disks'][0]['label'], 'test')
+        self.assertNotIn('controls_enabled', payload)
+
+
 if __name__ == '__main__':
     unittest.main()
