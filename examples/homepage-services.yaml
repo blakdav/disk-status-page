@@ -1,23 +1,23 @@
 # Merge this group into Homepage's services.yaml.
 # GET reads cached observations only; do not configure POST /api/action here.
 # Replace href with your NPM HTTPS address if desired.
+#
+# Only two cards have a status dot. Homepage's dot can only be green (the
+# URL answers with HTTP 403 or below) or red (above, or no answer):
+# - Disk Details: /healthz/disks is red if a disk needs attention, a disk
+#   is awake/asleep against its role, or the collector's data is stale.
+# - SnapRAID Sync: /healthz/sync is red if the last sync failed or was
+#   interrupted, its status can't be read, or none succeeded in 30 hours.
 - Storage:
     - Disk Status:
         href: http://172.23.24.16:8088
         description: NAS disk state and health
-        # Independent HTTP check; red if the collector data stops advancing.
-        siteMonitor: http://172.23.24.16:8088/healthz
-        statusStyle: dot
         widget:
           type: customapi
           url: http://172.23.24.16:8088/api/homepage
           refreshInterval: 30000
-          # Block view shows only four fields; list keeps freshness visible.
           display: list
           mappings:
-            - field: freshness.label
-              label: Data
-              format: text
             - field: summary.awake
               label: "Awake"
               format: number
@@ -37,7 +37,7 @@
     # unacknowledged issues, e.g. "Cold spare · Awake (expected asleep)".
     - Disk Details:
         href: http://172.23.24.16:8088
-        siteMonitor: http://172.23.24.16:8088/healthz
+        siteMonitor: http://172.23.24.16:8088/healthz/disks
         statusStyle: dot
         widget:
           type: customapi
@@ -51,7 +51,7 @@
             limit: 8
     - SnapRAID Sync:
         href: http://172.23.24.16:8088
-        siteMonitor: http://172.23.24.16:8088/healthz
+        siteMonitor: http://172.23.24.16:8088/healthz/sync
         statusStyle: dot
         widget:
           type: customapi
@@ -76,8 +76,6 @@
               format: text
     - Pool Capacity:
         href: http://172.23.24.16:8088
-        siteMonitor: http://172.23.24.16:8088/healthz
-        statusStyle: dot
         widget:
           type: customapi
           url: http://172.23.24.16:8088/api/homepage

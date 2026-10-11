@@ -20,6 +20,9 @@ ROOT = Path(__file__).parent
 INTERVAL = max(10, int(os.getenv('POLL_SECONDS', '60')))
 SMART_INTERVAL = max(INTERVAL, int(os.getenv('SMART_SECONDS', '1800')))
 DEMO = os.getenv('DEMO', 'false').lower() == 'true'
+# The sync timer runs daily; no successful sync for longer than this means
+# runs are failing to start or happen, and /healthz/sync turns unhealthy.
+SYNC_MAX_AGE = float(os.getenv('SYNC_MAX_AGE_HOURS', '30')) * 3600
 STOP = threading.Event()
 DB = Path(os.getenv('DATA_DIR', '/data')) / 'history.sqlite3'
 # The host's /dev. Compose mounts it at /host/dev so the container keeps its
@@ -433,7 +436,7 @@ def snapraid_status():
                 raw['finished_at'], ZoneInfo('America/Los_Angeles')).strftime('%b %d, %Y %I:%M %p %Z')
     except FileNotFoundError:
         mounted = os.path.ismount('/host/snapraid')
-        result.update(state='unknown',
+        result.update(state='unknown', awaiting_first=mounted,
                       state_label='Awaiting first recorded sync' if mounted else 'Status mount missing',
                       detail='History begins with the next service run.' if mounted else
                       'Add the SnapRAID status bind mount to Compose and recreate the container.')
@@ -544,11 +547,42 @@ def collector_freshness(payload):
     age = max((now - t for t in observations), default=0)
     state = ('stale' if missing or future or age > interval * 3 else
              'delayed' if age > interval * 2 else 'current')
-    labels = {'current': '🟢 Current', 'delayed': '🟠 Delayed', 'stale': '🔴 Stale'}
+    labels = {'current': 'Current', 'delayed': 'Delayed', 'stale': 'Stale'}
     if missing:
-        labels['stale'] = '🔴 Awaiting data'
+        labels['stale'] = 'Awaiting data'
     return {'state': state, 'label': labels[state],
             'oldest_observation_age_seconds': max(0, age) if not missing else None}
+
+
+def disks_health(payload):
+    """Healthy only when every disk is current, fine, and in its expected state."""
+    problems = []
+    freshness = collector_freshness(payload)
+    if freshness['state'] != 'current':
+        problems.append(f"Collector data {freshness['label'].lower()}")
+    for disk in payload['disks']:
+        if disk.get('needs_attention'):
+            problems.append(f"{disk['label']} needs attention")
+        elif disk.get('unexpected_state'):
+            problems.append(f"{disk['label']} should be {disk['expected_state']}")
+    return {'ok': not problems, 'problems': problems}
+
+
+def sync_health(sync, now):
+    """Healthy while a sync runs, before the first recorded one, or after a
+    recent success; unhealthy on failure, interruption, unreadable status, or
+    no success within SYNC_MAX_AGE."""
+    state = sync.get('state')
+    problems = []
+    if state == 'running' or sync.get('awaiting_first'):
+        pass
+    elif state in ('interrupted', 'unknown'):
+        problems.append(sync.get('state_label') or 'Sync status unavailable')
+    elif sync.get('last_result') != 'success':
+        problems.append('Last sync ' + (sync.get('result_label') or 'not recorded').lower())
+    elif now - (sync.get('last_success_at') or 0) > SYNC_MAX_AGE:
+        problems.append(f'No successful sync in {SYNC_MAX_AGE / 3600:g} hours')
+    return {'ok': not problems, 'problems': problems}
 
 
 def homepage_status(payload):
@@ -606,6 +640,8 @@ def homepage_status(payload):
             'snapraid': payload.get('snapraid', {}),
             'schedules': payload.get('schedules', {}), 'pool': payload.get('pool', {}),
             'freshness': collector_freshness(payload),
+            'disks_health': disks_health(payload),
+            'sync_health': sync_health(payload.get('snapraid', {}), payload['server_time']),
             'generated_at': payload['server_time']}
 
 
@@ -793,6 +829,12 @@ def run_collector(configs):
             next_poll = time.monotonic() + INTERVAL
 
 
+# /healthz: the collector is running (Docker's healthcheck). /healthz/disks
+# and /healthz/sync: for Homepage's status dots, which are green for an HTTP
+# status of 403 or below and red above it.
+HEALTH_PATHS = ('/healthz', '/healthz/disks', '/healthz/sync')
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path not in ('/api/action', '/api/unlock'):
@@ -843,25 +885,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def health(self, path, payload):
+        """(healthy, body) for a health URL, or None for any other path."""
+        if path == '/healthz':
+            freshness = collector_freshness(payload)
+            fresh = freshness['state'] == 'current'
+            return fresh, {'collector_recent': fresh, 'freshness': freshness}
+        if path == '/healthz/disks':
+            result = disks_health(payload)
+            return result['ok'], result
+        if path == '/healthz/sync':
+            result = sync_health(payload['snapraid'], payload['server_time'])
+            return result['ok'], result
+        return None
+
     def do_HEAD(self):
-        if self.path.split('?')[0] != '/healthz':
+        path = self.path.split('?')[0]
+        if path not in HEALTH_PATHS:
             self.send_error(405)
             return
-        freshness = collector_freshness(snapshot())
-        self.send_response(200 if freshness['state'] == 'current' else 503)
+        healthy, _ = self.health(path, snapshot())
+        self.send_response(200 if healthy else 503)
         self.send_header('Cache-Control', 'no-store')
         self.send_header('Content-Length', '0')
         self.end_headers()
 
     def do_GET(self):
         path = self.path.split('?')[0]
-        if path in ('/api/status', '/api/homepage', '/healthz'):
+        if path in ('/api/status', '/api/homepage', *HEALTH_PATHS):
             payload = snapshot()
-            if path == '/healthz':
-                freshness = collector_freshness(payload)
-                fresh = freshness['state'] == 'current'
-                self.send_response(200 if fresh else 503)
-                body = json.dumps({'collector_recent': fresh, 'freshness': freshness}).encode()
+            if path in HEALTH_PATHS:
+                healthy, result = self.health(path, payload)
+                self.send_response(200 if healthy else 503)
+                body = json.dumps(result).encode()
             else:
                 self.send_response(200)
                 body = json.dumps(homepage_status(payload) if path == '/api/homepage' else payload).encode()

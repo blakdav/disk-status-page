@@ -628,3 +628,67 @@ class ExpectedStateTests(unittest.TestCase):
             disk = app.snapshot()['disks'][0]
         self.assertEqual(disk['role'], 'Pool data')
         self.assertFalse(disk['unexpected_state'])
+
+
+class HomepageDotTests(unittest.TestCase):
+    NOW = 1_000_000
+
+    def payload(self, disks, observed=None):
+        return {'server_time': self.NOW, 'poll_seconds': 30,
+                'disks': [{'label': f'd{i}', 'observed_at': observed or self.NOW, **d}
+                          for i, d in enumerate(disks)]}
+
+    def test_disks_dot(self):
+        fine = {'needs_attention': False, 'unexpected_state': False}
+        self.assertTrue(app.disks_health(self.payload([fine, fine]))['ok'])
+        result = app.disks_health(self.payload([fine, {**fine, 'needs_attention': True}]))
+        self.assertEqual(result, {'ok': False, 'problems': ['d1 needs attention']})
+        result = app.disks_health(self.payload([{**fine, 'unexpected_state': True, 'expected_state': 'asleep'}]))
+        self.assertEqual(result['problems'], ['d0 should be asleep'])
+        result = app.disks_health(self.payload([fine], observed=self.NOW - 3600))
+        self.assertEqual(result['problems'], ['Collector data stale'])
+
+    def test_sync_dot(self):
+        ok = lambda sync: app.sync_health(sync, self.NOW)['ok']
+        recent = self.NOW - 3600
+        self.assertTrue(ok({'state': 'running'}))
+        self.assertTrue(ok({'state': 'unknown', 'awaiting_first': True}))
+        self.assertTrue(ok({'state': 'idle', 'last_result': 'success', 'last_success_at': recent}))
+        self.assertFalse(ok({'state': 'idle', 'last_result': 'exit-code', 'result_label': 'Failed: exit-code',
+                             'last_success_at': recent}))
+        self.assertFalse(ok({'state': 'interrupted', 'state_label': 'Interrupted by reboot'}))
+        self.assertFalse(ok({'state': 'unknown', 'awaiting_first': False, 'state_label': 'Status mount missing'}))
+        old = self.NOW - 31 * 3600
+        result = app.sync_health({'state': 'idle', 'last_result': 'success', 'last_success_at': old}, self.NOW)
+        self.assertEqual(result['problems'], ['No successful sync in 30 hours'])
+
+    def test_awaiting_first_sync_is_marked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path
+            with patch('app.Path', side_effect=lambda v: original(directory) / 'none'
+                       if v == '/host/snapraid/sync.json' else original(v)), \
+                 patch('app.os.path.ismount', return_value=True):
+                self.assertTrue(app.snapraid_status()['awaiting_first'])
+
+    def test_health_urls_return_503_when_unhealthy(self):
+        import io, json
+        from email.message import Message
+        payload = {**self.payload([{'needs_attention': True, 'unexpected_state': False}]),
+                   'snapraid': {'state': 'interrupted', 'state_label': 'Interrupted by reboot'}}
+        for method in ('GET', 'HEAD'):
+            for path in ('/healthz/disks', '/healthz/sync'):
+                handler = object.__new__(app.Handler)
+                handler.path, handler.command = path, method
+                handler.request_version = 'HTTP/1.1'
+                handler.requestline = f'{method} {path} HTTP/1.1'
+                handler.wfile, handler.headers = io.BytesIO(), Message()
+                with patch('app.snapshot', return_value=payload):
+                    getattr(handler, 'do_' + method)()
+                raw = handler.wfile.getvalue()
+                self.assertIn(b' 503 ', raw.split(b'\r\n')[0], (method, path))
+                if method == 'GET':
+                    self.assertFalse(json.loads(raw.split(b'\r\n\r\n', 1)[1])['ok'])
+
+    def test_freshness_labels_are_plain_text(self):
+        label = app.collector_freshness(self.payload([{}]))['label']
+        self.assertEqual(label, 'Current')
