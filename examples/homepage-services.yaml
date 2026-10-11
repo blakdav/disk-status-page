@@ -3,7 +3,6 @@
 # Replace href with your NPM HTTPS address if desired.
 - Storage:
     - Disk Status:
-        id: disk-status-summary
         href: http://172.23.24.16:8088
         description: NAS disk state and health
         # Independent HTTP check; red if the collector data stops advancing.
@@ -34,7 +33,6 @@
     # Optional detailed panel; requires a Homepage version supporting
     # Custom API dynamic-list. This lists every configured disk separately.
     - Disk Details:
-        id: disk-status-details
         href: http://172.23.24.16:8088
         siteMonitor: http://172.23.24.16:8088/healthz
         statusStyle: dot
