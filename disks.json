@@ -1,10 +1,50 @@
 [
-  {"label":"data1","role":"Pool data","serial":"ZGY8RZSW"},
-  {"label":"data2","role":"Pool data","serial":"ZGY8R853"},
-  {"label":"parity1","role":"Parity","serial":"WD-WX22DA540ESV"},
-  {"label":"data3","role":"Intended spare","serial":"WD-WCC7K6PKXARD"},
-  {"label":"data4","role":"Intended spare","serial":"WD-WX22DA540VSH"},
-  {"label":"data5","role":"Intended spare","serial":"WD-WX22DA540UJ2"},
-  {"label":"data6","role":"Intended spare","serial":"WD-WCC7K6LTTK50"},
-  {"label":"data7","role":"Intended spare","serial":"ZGY8RNHK"}
+  {
+    "label": "data1",
+    "role": "Pool data",
+    "serial": "ZGY8RZSW",
+    "allow_spindown": false
+  },
+  {
+    "label": "data2",
+    "role": "Pool data",
+    "serial": "ZGY8R853",
+    "allow_spindown": false
+  },
+  {
+    "label": "parity1",
+    "role": "Parity",
+    "serial": "WD-WX22DA540ESV",
+    "allow_spindown": false
+  },
+  {
+    "label": "data3",
+    "role": "Intended spare",
+    "serial": "WD-WCC7K6PKXARD",
+    "allow_spindown": true
+  },
+  {
+    "label": "data4",
+    "role": "Intended spare",
+    "serial": "WD-WX22DA540VSH",
+    "allow_spindown": true
+  },
+  {
+    "label": "data5",
+    "role": "Intended spare",
+    "serial": "WD-WX22DA540UJ2",
+    "allow_spindown": true
+  },
+  {
+    "label": "data6",
+    "role": "Intended spare",
+    "serial": "WD-WCC7K6LTTK50",
+    "allow_spindown": true
+  },
+  {
+    "label": "data7",
+    "role": "Intended spare",
+    "serial": "ZGY8RNHK",
+    "allow_spindown": true
+  }
 ]

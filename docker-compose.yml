@@ -4,19 +4,32 @@ services:
     container_name: disk-status-page
     restart: unless-stopped
     # Initial hardware-compatible configuration; reduce after NAS testing.
-    # This grants broad host access. The app provides no disk write actions.
+    # This grants broad host access. Explicit disk actions require the generated action token.
     privileged: true
     ports:
       - "8088:8080"
     environment:
       TZ: America/Los_Angeles
-      POLL_SECONDS: "60"
+      POLL_SECONDS: "30"
       SMART_SECONDS: "1800"
     volumes:
       # NVMe storage: recording history must not wake the monitored disks.
       - /mnt/vault/apps/disk-status-page:/data
       # Includes serial-based udev links and supports disks across reboots.
       - /dev:/dev:ro
+      # Spin-down checks must use the NAS mount namespace, not the container's.
+      - type: bind
+        source: /proc/1/mountinfo
+        target: /host/mountinfo
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /proc/swaps
+        target: /host/swaps
+        read_only: true
+        bind:
+          create_host_path: false
     logging:
       driver: json-file
       options:

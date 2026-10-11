@@ -1,7 +1,11 @@
-"""Disk Status Page: read-only ATA monitoring and a small HTTP dashboard."""
+"""Disk Status Page: ATA monitoring and explicit disk controls and a small HTTP dashboard."""
 import glob
 from contextlib import contextmanager
 import json
+import hmac
+import secrets
+import queue
+from urllib.parse import urlsplit
 import logging
 import os
 from pathlib import Path
@@ -20,6 +24,20 @@ STOP = threading.Event()
 DB = Path(os.getenv('DATA_DIR', '/data')) / 'history.sqlite3'
 WARNINGS = {5, 187, 188, 197, 198, 199}
 COUNTERS = {4, 12, 193}
+CONFIGS = []
+ACTION_TOKEN = ''
+JOBS = queue.Queue(maxsize=1)
+JOB_LOCK = threading.Lock()
+JOB = None
+
+
+def load_token():
+    token_file = DB.parent / 'action-token'
+    if not token_file.exists():
+        with open(token_file, 'x', opener=lambda p, f: os.open(p, f, 0o600)) as out:
+            out.write(secrets.token_urlsafe(32))
+    return token_file.read_text().strip()
+
 
 
 @contextmanager
@@ -85,10 +103,11 @@ def summarize_smart(data, status):
             'warnings': warnings, 'counters': counters,
             'error_log': data.get('ata_smart_error_log', {}),
             'self_test_log': data.get('ata_smart_self_test_log', {}),
-            'attributes': attrs}
+            'attributes': attrs,
+            'test_status': data.get('ata_smart_data', {}).get('self_test', {}).get('status', {})}
 
 
-def collect(config, previous, now):
+def collect(config, previous, now, force_smart=False):
     disk = {**previous, **config, 'observed_at': now, 'error': None}
     path = device_for(config['serial'])
     disk['device'] = path
@@ -103,7 +122,7 @@ def collect(config, previous, now):
             disk['error'] = 'Power-state query failed or returned an unsupported response.'
             return disk
         # Fail closed: no SMART query unless the power-state query succeeded.
-        if disk['state'] == 'awake' and now - previous.get('smart_at', 0) >= SMART_INTERVAL:
+        if disk['state'] == 'awake' and (force_smart or (previous.get('smart', {}).get('test_status', {}).get('value', 0) & 0xf0 == 0xf0) or now - previous.get('smart_at', 0) >= SMART_INTERVAL):
             code, output = command(['smartctl', '-d', config.get('smart_type', 'ata'),
                                     '-n', 'standby,3,5', '-a', '-j', path])
             # Explicit type avoids autodetection; standby recheck handles races.
@@ -153,28 +172,215 @@ def snapshot():
                   for s, t, state in db.execute(
                       'SELECT * FROM events ORDER BY observed_at DESC LIMIT 100')]
     return {'demo': DEMO, 'poll_seconds': INTERVAL, 'smart_seconds': SMART_INTERVAL,
-            'server_time': time.time(), 'disks': list(disks.values()), 'events': events}
+            'server_time': time.time(), 'disks': list(disks.values()), 'events': events,
+            'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN) and not DEMO}
+
+
+def job_snapshot():
+    with JOB_LOCK:
+        return dict(JOB) if JOB else None
+
+
+def submit_job(action, serial=None, wake=False):
+    global JOB
+    if action not in ('refresh', 'spin-up', 'spin-down', 'health', 'test'):
+        raise ValueError('Unknown action')
+    if action != 'refresh' and serial not in {c['serial'] for c in CONFIGS}:
+        raise ValueError('Unknown disk serial')
+    with JOB_LOCK:
+        if JOB and JOB['state'] in ('queued', 'running'):
+            raise ValueError('An action is already running; please wait')
+        JOB = {'id': secrets.token_hex(8), 'action': action, 'serial': serial,
+               'state': 'queued', 'message': 'Queued', 'wake': wake}
+        JOBS.put_nowait(dict(JOB))
+        return dict(JOB)
+
+
+def verify_unmounted(config, path):
+    if not config.get('allow_spindown', False):
+        raise ValueError('Spin-down is enabled only for configured spare disks')
+    # Container mount tables cannot establish whether the HOST uses a disk.
+    real = Path('/sys/class/block') / Path(os.path.realpath(path)).name
+    nodes = [real] + [p for p in real.iterdir() if (p / 'partition').exists()]
+    devices = {p.joinpath('dev').read_text().strip() for p in nodes}
+    for p in nodes:
+        if any(p.joinpath('holders').iterdir()):
+            raise ValueError('Disk has active kernel holders; spin-down refused')
+    mounts = Path('/host/mountinfo').read_text().splitlines()
+    if not mounts:
+        raise ValueError('Host mount information is unavailable')
+    if any(line.split()[2] in devices for line in mounts):
+        raise ValueError('Disk or a partition is mounted on the NAS')
+    for line in Path('/host/swaps').read_text().splitlines()[1:]:
+        info = os.stat(line.split()[0])
+        if f'{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}' in devices:
+            raise ValueError('Disk is used for swap')
+
+
+def wake_disk(path):
+    code, output = command(['dd', 'if=' + path, 'of=/dev/null', 'bs=4096',
+                            'count=1', 'iflag=direct', 'status=none'])
+    if code:
+        raise ValueError('Disk wake failed: ' + output[:300])
+
+
+def smart_probe(config, path):
+    code, output = command(['smartctl', '-d', config.get('smart_type', 'ata'),
+                            '-n', 'standby,3,5', '-a', '-j', path])
+    if code == 3:
+        return None
+    if code & 7:
+        raise ValueError('Cannot safely read SMART/test status')
+    return json.loads(output)
+
+
+def test_running(data):
+    status = data.get('ata_smart_data', {}).get('self_test', {}).get('status', {})
+    value = status.get('value')
+    if not isinstance(value, int):
+        raise ValueError('Self-test status unavailable; action refused')
+    return value & 0xf0 == 0xf0
+
+
+def execute_job(job):
+    if job['action'] == 'refresh':
+        errors = []
+        for config in CONFIGS:
+            previous = stored().get(config['serial'], {})
+            disk = collect(config, previous, time.time(), force_smart=True)
+            save(disk, previous)
+            if disk.get('error'):
+                errors.append(config['label'] + ': ' + disk['error'])
+        if errors:
+            raise ValueError('; '.join(errors))
+        return 'Updated disk states and awake-disk health; sleeping disks were skipped.'
+    config = next(c for c in CONFIGS if c['serial'] == job['serial'])
+    path = device_for(config['serial'])
+    if not path:
+        raise ValueError('Disk not found')
+    previous = stored().get(config['serial'], {})
+    # Take a real pre-action observation rather than relying on cached state.
+    before = collect(config, previous, time.time())
+    save(before, previous)
+    if before['state'] == 'unknown':
+        raise ValueError(before.get('error') or 'Power state unknown')
+    action = job['action']
+    try:
+        if action == 'spin-up':
+            wake_disk(path)
+        elif action == 'spin-down':
+            verify_unmounted(config, path)
+            if before['state'] == 'awake':
+                data = smart_probe(config, path)
+                if data is not None and test_running(data):
+                    raise ValueError('Self-test is running; spin-down refused')
+            # Recheck mounts immediately before sending standby.
+            verify_unmounted(config, path)
+            code, output = command(['hdparm', '-y', path])
+            if code:
+                raise ValueError('Standby request failed: ' + output[:300])
+        elif action in ('health', 'test'):
+            if before['state'] == 'standby':
+                if not job['wake']:
+                    raise ValueError('Disk is asleep; confirm waking it to continue')
+                wake_disk(path)
+            if action == 'test':
+                data = smart_probe(config, path)
+                if data is None:
+                    raise ValueError('Disk returned to standby; retry')
+                if test_running(data):
+                    raise ValueError('A SMART self-test is already running')
+                code, output = command(['smartctl', '-d', config.get('smart_type', 'ata'),
+                                        '-n', 'standby,3,5', '-t', 'long', '-j', path])
+                if code & 7:
+                    raise ValueError('Extended self-test could not be started')
+    finally:
+        # Always return observed results, including after a failed command.
+        after = collect(config, before, time.time(), force_smart=True)
+        save(after, before)
+    if after.get('error'):
+        raise ValueError(after['error'])
+    expected = {'spin-up': 'awake', 'spin-down': 'standby'}.get(action)
+    if expected and after['state'] != expected:
+        raise ValueError('Requested state was not observed; disk may be in use')
+    return ('Extended self-test requested; the drive runs it in the background. '
+            'Refresh health to see progress/results.' if action == 'test'
+            else 'Action finished; disk information updated.')
 
 
 def run_collector(configs):
+    global JOB
+    next_poll = 0
     while not STOP.is_set():
-        started = time.monotonic()
-        previous = stored()
-        for i, config in enumerate(configs):
-            old = previous.get(config['serial'], {})
-            if DEMO:
-                now = time.time()
-                disk = {**old, **config, 'observed_at': now, 'state': 'awake' if i < 3 else 'standby',
-                        'error': None, 'smart_at': now - (7200 if i >= 3 else 0),
-                        'smart': {'passed': True, 'temperature': 32 + i, 'warnings': [],
-                                  'counters': {'Start_Stop_Count': 120 + i, 'Load_Cycle_Count': 800 + i}}}
-            else:
-                disk = collect(config, old, time.time())
-            save(disk, old)
-        STOP.wait(max(1, INTERVAL - (time.monotonic() - started)))
+        try:
+            job = JOBS.get(timeout=max(0, next_poll - time.monotonic()))
+        except queue.Empty:
+            job = None
+        if job:
+            with JOB_LOCK:
+                JOB.update(state='running', message='Running')
+            try:
+                message = execute_job(job)
+                state = 'done'
+            except Exception as exc:
+                logging.exception('Disk action failed')
+                message, state = str(exc), 'failed'
+            with JOB_LOCK:
+                JOB.update(state=state, message=message)
+            JOBS.task_done()
+        else:
+            previous = stored()
+            for i, config in enumerate(configs):
+                old = previous.get(config['serial'], {})
+                if DEMO:
+                    now = time.time()
+                    disk = {**old, **config, 'observed_at': now, 'state': 'awake' if i < 3 else 'standby',
+                            'error': None, 'smart_at': now - (7200 if i >= 3 else 0),
+                            'smart': {'passed': True, 'temperature': 32 + i, 'warnings': [],
+                                      'counters': {'Start_Stop_Count': 120 + i, 'Load_Cycle_Count': 800 + i}}}
+                else:
+                    disk = collect(config, old, time.time())
+                save(disk, old)
+            next_poll = time.monotonic() + INTERVAL
 
 
 class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path != '/api/action':
+            self.send_error(404)
+            return
+        # JSON plus a custom authentication header prevents form-based CSRF;
+        # no CORS support is provided. Also reject foreign browser origins.
+        origin = self.headers.get('Origin')
+        same_origin = not origin or urlsplit(origin).netloc == self.headers.get('Host')
+        supplied = self.headers.get('X-Action-Token', '')
+        if (DEMO or not ACTION_TOKEN or not same_origin
+                or not hmac.compare_digest(supplied, ACTION_TOKEN)):
+            self.respond_json(403, {'error': 'Unlock controls with the NAS action token'})
+            return
+        try:
+            if self.headers.get('Content-Type') != 'application/json':
+                raise ValueError('JSON required')
+            length = int(self.headers.get('Content-Length', '0'))
+            if not 0 < length <= 4096:
+                raise ValueError('Invalid request size')
+            body = json.loads(self.rfile.read(length))
+            if not isinstance(body, dict):
+                raise ValueError('Object required')
+            job = submit_job(body.get('action'), body.get('serial'), body.get('wake') is True)
+            self.respond_json(202, job)
+        except (ValueError, TypeError) as exc:
+            self.respond_json(400, {'error': str(exc)})
+
+    def respond_json(self, code, value):
+        body = json.dumps(value).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         path = self.path.split('?')[0]
         if path in ('/api/status', '/healthz'):
@@ -212,6 +418,8 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     configs = json.loads(Path(os.getenv('DISKS_FILE', str(ROOT / 'disks.json'))).read_text())
     initialize()
+    CONFIGS = configs
+    ACTION_TOKEN = '' if DEMO else load_token()
     def worker():
         try:
             run_collector(configs)

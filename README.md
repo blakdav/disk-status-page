@@ -3,11 +3,12 @@
 A single container on debian-nas collects disk power state, caches SMART
 health, stores observed transitions in SQLite, and serves a home-network
 dashboard. No third-party Python dependencies, frontend build, or database
-server. The app never requests a spin-down or initiates a SMART self-test.
+server. Monitoring is passive by default; authenticated controls can wake
+disks, put unmounted spares in standby, or request extended SMART self-tests.
 
 ## Monitoring behavior
 
-- Checks power state every 60 seconds using `hdparm -C`.
+- Checks power state every 30 seconds with the supplied Compose file using `hdparm -C`.
 - Resolves configured serials using `/dev/disk/by-id/ata-*` links; never
   identifies a disk by its changing `sdX` name and never runs a discovery scan.
 - Reads SMART at most every 30 minutes per awake disk. Explicit `-d ata`
@@ -120,7 +121,8 @@ The app runs as root for disk queries; PUID/PGID are not supported.
 Direct URL: http://172.23.24.16:8088. Configure Nginx Proxy Manager on the
 Docker VM to forward the chosen hostname to `172.23.24.16:8088`, enabling
 HTTPS there. No Docker network shared across hosts is needed. The dashboard
-has no login and should remain on the trusted home network.
+is readable without login. Actions require the generated NAS token. Keep
+it on the trusted home network and use HTTPS through NPM for controls.
 
 Optional disk configuration override:
 
@@ -156,10 +158,90 @@ smartd; host background monitoring remains separate from this container.
 
 ## Current validation
 
-Seven unit tests pass, covering sleeping/unknown states, standby races,
+Seventeen unit tests pass, covering sleeping/unknown states, standby races,
 unsupported SMART power checks, health warning bits, persisted transitions,
 observation gaps, and HTTP responses tested without sockets. Python compiles,
 YAML parses, and `docker compose config --quiet` passes. This development
 environment denies Docker daemon access and listening sockets, so the image
 build, live HTTP/browser preview, and NAS hardware checks are still pending.
-No image has been published and no server deployment has been performed.
+The initial version has been published and validated on the NAS. These new
+controls have not yet been published or tested on physical disks.
+
+
+## Disk controls and manual refresh
+
+The header's **Refresh disks** button requests a new collector pass. It
+checks all disk states and refreshes health data only on awake disks. It
+never wakes sleeping disks. The normal polling interval remains independent
+of the browser's polling for already-collected results.
+
+Each disk has **Spin up**, **Spin down**, **Refresh health**, and
+**Extended self-test** controls. A health refresh retrieves counters and
+logs; it does not run a self-test. Sleeping disks require explicit wake
+confirmation for health reads or tests. Extended tests have an additional
+confirmation and run in the drive for hours, without blocking the server.
+Their status and logs appear in the dashboard. While a test is observed
+running, the collector retrieves health/test status every collection cycle.
+It does not prevent the drive's own standby timer or another host process
+from interrupting a test. The app never forcibly replaces a running test.
+
+Only configured disks can be targeted. `allow_spindown: true` enables
+spin-down eligibility; it is set only for the five intended spares. The
+server also checks the host's mounts, swap and kernel holders, and refuses
+spin-down if it cannot verify those checks. Mounted pool/parity disks are
+ineligible. A running or unreadable self-test status blocks spin-down on an
+awake disk. These checks cannot prevent another host process from mounting
+or using a disk immediately afterward; coordinate administrative disk work.
+
+Compose now requires read-only binds of `/proc/1/mountinfo` and `/proc/swaps`
+into `/host`. Existing deployments must update their Compose file, not
+just pull the new image. These files expose the NAS's state rather than the
+container's mount namespace. Missing host information disables spin-down
+by failing the check; other actions and monitoring can continue.
+
+Actions and regular collection run sequentially in one worker, avoiding
+collector/action races. Only one action is accepted at a time. The UI shows
+queued/running/completed/failed status and automatically fetches observed
+results after every action. It never assumes a command changed the disk's
+state. The latest action status is transient and resets on restart; disk
+history and health cache remain persistent.
+
+On first production startup, a random action token is saved at
+`/data/action-token` with mode 0600. Retrieve it locally on the NAS:
+
+```bash
+docker exec disk-status-page cat /data/action-token
+```
+
+Open the dashboard through your NPM HTTPS URL, choose **Unlock controls**,
+and enter the token. It is kept only in the page's memory, discarded on
+reload, and never embedded in repository files or returned by the public
+API. Use **Lock controls** when done. All action requests, including manual
+refresh, require it. Requests use POST with JSON, a custom token header and
+same-origin checks; cross-origin requests are not permitted. NPM must
+preserve the original Host header (its usual proxy configuration does).
+Do not share the token or put it into URL parameters.
+
+## Updating this version
+
+After committing/pushing and confirming the GitHub Actions publication,
+update `docker-compose.yml` on the NAS to the version in this repository
+(including both `/host` binds), keeping any intentional local settings.
+The supplied Compose interval is now 30 seconds.
+
+Then, on debian-nas:
+
+```bash
+cd /opt/docker/disk-status-page
+docker compose config --quiet
+docker pull ghcr.io/blakdav/disk-status-page:latest
+docker compose up -d
+docker compose ps
+docker compose logs --tail=50
+```
+
+No Ansible changes are required for this update. Existing history remains
+in the same NVMe directory. The GitHub Actions workflow still publishes
+`latest` and `sha-<full-commit-sha>` using `GITHUB_TOKEN` with
+`contents: read` and `packages: write`. Private GHCR authentication, if
+applicable, is described above.
