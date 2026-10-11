@@ -64,6 +64,8 @@ def initialize():
         db.execute('CREATE TABLE IF NOT EXISTS acknowledgements '
                    '(serial TEXT, attribute_id INTEGER, baseline INTEGER, '
                    'acknowledged_at REAL, PRIMARY KEY(serial, attribute_id))')
+        db.execute('CREATE TABLE IF NOT EXISTS extended_tests '
+                   '(serial TEXT PRIMARY KEY, payload TEXT NOT NULL)')
 
 
 def command(args):
@@ -168,25 +170,115 @@ def collect(config, previous, now, force_smart=False):
     return disk
 
 
+def latest_extended_entry(smart):
+    # SMART log order is newest first; the log entry number changes whenever
+    # another test is added, so it must not be part of the identity.
+    table = smart.get('self_test_log', {}).get('standard', {}).get('table', [])
+    for entry in table:
+        test_type = entry.get('type', {})
+        if test_type.get('value') in (2, 130) or 'extended' in test_type.get('string', '').lower():
+            return entry
+    return None
+
+
+def extended_entry_key(entry):
+    if not entry:
+        return None
+    return json.dumps({k: entry.get(k) for k in
+                       ('type', 'status', 'lifetime_hours', 'lba')}, sort_keys=True)
+
+
+def entry_in_progress(entry):
+    status = entry.get('status', {})
+    return (status.get('value') in (15, 240)
+            or 'in progress' in status.get('string', '').lower())
+
+
+def write_test_tracking(db, serial, tracking):
+    db.execute('INSERT INTO extended_tests VALUES (?, ?) '
+               'ON CONFLICT(serial) DO UPDATE SET payload = excluded.payload',
+               (serial, json.dumps(tracking)))
+
+
+def read_test_tracking(db, serial):
+    row = db.execute('SELECT payload FROM extended_tests WHERE serial = ?', (serial,)).fetchone()
+    return json.loads(row[0]) if row else {}
+
+
+def record_extended_start(serial, before_smart, requested_at):
+    with connect() as db:
+        tracking = read_test_tracking(db, serial)
+        # Import any prior result without inventing its calendar date.
+        tracking = observe_extended_test(tracking, before_smart, requested_at)
+        tracking.update(last_started_at=requested_at, last_started_source='app',
+                        pending={'started_at': requested_at, 'source': 'app',
+                                 'baseline_key': extended_entry_key(latest_extended_entry(before_smart))})
+        write_test_tracking(db, serial, tracking)
+
+
+def observe_extended_test(tracking, smart, observed_at):
+    tracking = dict(tracking)
+    entry = latest_extended_entry(smart)
+    if not entry:
+        return tracking
+    key = extended_entry_key(entry)
+    previous_key = tracking.get('latest_log_key')
+    if entry_in_progress(entry):
+        # Only an explicitly extended log entry establishes an external long
+        # test; generic execution status can also describe a short test.
+        pending = tracking.get('pending')
+        if not pending:
+            tracking.update(last_started_at=observed_at, last_started_source='observed',
+                            pending={'started_at': observed_at, 'source': 'observed',
+                                     'baseline_key': previous_key})
+        tracking['latest_log_key'] = key
+        return tracking
+    pending = tracking.get('pending')
+    new_result = key != previous_key
+    if not new_result:
+        return tracking
+    # A result already present before the request is not that test's result.
+    if pending and key == pending.get('baseline_key'):
+        return tracking
+    correlated = bool(pending)
+    tracking.update(latest_log_key=key,
+                    last_result=entry.get('status', {}).get('string', 'Unknown result'),
+                    last_result_passed=entry.get('status', {}).get('passed'),
+                    last_result_power_on_hours=entry.get('lifetime_hours'),
+                    result_discovered_at=observed_at,
+                    result_source='observed' if correlated or previous_key is not None else 'historical',
+                    last_observed_completed_at=observed_at if correlated or previous_key is not None else None)
+    # Completed includes aborted/failed attempts; passed remains separate.
+    if correlated:
+        tracking.pop('pending', None)
+    return tracking
+
+
 def save(disk, previous):
     # A first sample, restart gap, or unknown sample does not prove a transition.
     contiguous = (previous.get('state') in ('awake', 'standby')
                   and disk['observed_at'] - previous.get('observed_at', 0) < INTERVAL * 2.5)
     changed = contiguous and disk['state'] in ('awake', 'standby') and disk['state'] != previous['state']
     with connect() as db:
+        # Cached readings on sleeping disks must not advance test timestamps.
+        tracking = read_test_tracking(db, disk['serial'])
+        if disk.get('smart') and (not tracking or disk.get('smart_at') != previous.get('smart_at')):
+            tracking = observe_extended_test(tracking, disk['smart'], disk.get('smart_at') or disk['observed_at'])
+            write_test_tracking(db, disk['serial'], tracking)
         if changed:
             key = 'last_up' if disk['state'] == 'awake' else 'last_down'
             disk[key] = disk['observed_at']
             db.execute('INSERT INTO events VALUES (?, ?, ?)',
                        (disk['serial'], disk['observed_at'], disk['state']))
-        db.execute('INSERT OR REPLACE INTO disks VALUES (?, ?)',
+        db.execute('INSERT INTO disks VALUES (?, ?) '
+                   'ON CONFLICT(serial) DO UPDATE SET payload = excluded.payload',
                    (disk['serial'], json.dumps(disk)))
         db.execute('DELETE FROM events WHERE observed_at < ?', (time.time() - 365 * 86400,))
 
 
 def stored():
     with connect() as db:
-        return {serial: json.loads(payload) for serial, payload in db.execute('SELECT * FROM disks')}
+        return {serial: json.loads(payload) for serial, payload in db.execute('SELECT * FROM disks ORDER BY serial')}
 
 
 def warning_issues(smart):
@@ -260,16 +352,20 @@ def acknowledge_warning(serial, attribute_id, expected_raw, clear=False):
 def snapshot():
     disks = stored()
     now = time.time()
+    # UI order comes from inventory, never SQLite row/update order.
     if CONFIGS:
         disks = {c['serial']: disks.get(c['serial'], {
             **c, 'state': 'unknown', 'observed_at': 0,
             'error': 'Awaiting first observation'}) for c in CONFIGS}
     with connect() as db:
+        extended_tests = {s: json.loads(p) for s, p in db.execute('SELECT * FROM extended_tests')}
         acknowledgements = {(s, a): {"baseline": b, "acknowledged_at": t}
                             for s, a, b, t in db.execute("SELECT * FROM acknowledgements")}
         events = [{'serial': s, 'observed_at': t, 'state': state}
                   for s, t, state in db.execute(
                       'SELECT * FROM events ORDER BY observed_at DESC LIMIT 100')]
+    for serial, disk in disks.items():
+        disk['extended_test'] = extended_tests.get(serial, {})
     return {'demo': DEMO, 'poll_seconds': INTERVAL, 'smart_seconds': SMART_INTERVAL,
             'server_time': now, 'disks': [decorate_disk(d, acknowledgements, now) for d in disks.values()], 'events': events,
             'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN) and not DEMO}
@@ -303,6 +399,7 @@ def homepage_status(payload):
                       'temperature': smart.get('temperature'),
                       'health_read_at': disk.get('smart_at'),
                       'observed_at': disk.get('observed_at'),
+                      'extended_test': disk.get('extended_test', {}),
                       'needs_attention': disk['needs_attention']})
     return {'demo': payload['demo'], 'summary': summary, 'disks': disks,
             'generated_at': payload['server_time']}
@@ -426,10 +523,12 @@ def execute_job(job):
                     raise ValueError('Disk returned to standby; retry')
                 if test_running(data):
                     raise ValueError('A SMART self-test is already running')
+                requested_at = time.time()
                 code, output = command(['smartctl', '-d', config.get('smart_type', 'ata'),
                                         '-n', 'standby,3,5', '-t', 'long', '-j', path])
                 if code & 7:
                     raise ValueError('Extended self-test could not be started')
+                record_extended_start(config['serial'], summarize_smart(data, 0), requested_at)
     finally:
         # Always return observed results, including after a failed command.
         after = collect(config, before, time.time(), force_smart=True)

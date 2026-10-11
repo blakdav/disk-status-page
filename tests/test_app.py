@@ -158,7 +158,7 @@ class ActionTests(unittest.TestCase):
         config = {'serial': 'test'}
         disk = {'serial': 'test', 'state': 'awake'}
         data = {'ata_smart_data': {'self_test': {'status': {'value': 0}}}}
-        with patch('app.CONFIGS', [config]), patch('app.device_for', return_value='/dev/test'), patch('app.stored', return_value={}), patch('app.collect', return_value=disk), patch('app.save'), patch('app.smart_probe', return_value=data), patch('app.command', return_value=(0, '{}')) as command:
+        with patch('app.CONFIGS', [config]), patch('app.device_for', return_value='/dev/test'), patch('app.stored', return_value={}), patch('app.collect', return_value=disk), patch('app.save'), patch('app.smart_probe', return_value=data), patch('app.record_extended_start'), patch('app.command', return_value=(0, '{}')) as command:
             message = app.execute_job({'action': 'test', 'serial': 'test', 'wake': False})
         args = command.call_args.args[0]
         self.assertIn('standby,3,5', args)
@@ -296,6 +296,23 @@ class HomepageAndAcknowledgementTests(unittest.TestCase):
         app.save(disk, {})
         self.assertTrue(app.snapshot()['disks'][0]['needs_attention'])
 
+    def test_inventory_order_stays_fixed_during_individual_disk_updates(self):
+        import time
+        configs = [{'serial': 'z', 'label': 'data1'},
+                   {'serial': 'a', 'label': 'data2'},
+                   {'serial': 'p', 'label': 'parity1'},
+                   {'serial': 'm', 'label': 'data6'}]
+        with patch('app.CONFIGS', configs):
+            # Simulate partial first collection, out-of-order inserts and
+            # single-disk refreshes observed between full collector passes.
+            for config in [configs[3], configs[0], configs[2], configs[1], configs[3], configs[0]]:
+                app.save({**config, 'state': 'awake', 'observed_at': time.time()}, {})
+                payload = app.snapshot()
+                self.assertEqual([d['label'] for d in payload['disks']],
+                                 ['data1', 'data2', 'parity1', 'data6'])
+                self.assertEqual([d['label'] for d in app.homepage_status(payload)['disks']],
+                                 ['data1', 'data2', 'parity1', 'data6'])
+
     def test_homepage_endpoint_returns_native_panel_shape(self):
         import io, json
         self.disk()
@@ -314,6 +331,106 @@ class HomepageAndAcknowledgementTests(unittest.TestCase):
         self.assertEqual(payload['summary']['attention'], 1)
         self.assertEqual(payload['disks'][0]['label'], 'test')
         self.assertNotIn('controls_enabled', payload)
+
+
+class ExtendedTestTrackingTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.patch = patch('app.DB', Path(self.directory.name) / 'history.sqlite3')
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.addCleanup(self.directory.cleanup)
+        app.initialize()
+
+    def smart(self, hours=100, status='Completed without error', passed=True, running=False):
+        return {'self_test_log': {'standard': {'table': [{
+            'num': 1, 'type': {'value': 2, 'string': 'Extended offline'},
+            'status': {'value': 15 if running else 0, 'string': status, 'passed': passed},
+            'lifetime_hours': hours
+        }]}}, 'test_status': {'value': 249 if running else 0}}
+
+    def tracking(self):
+        with app.connect() as db:
+            return app.read_test_tracking(db, 'test')
+
+    def save_read(self, smart, at, previous=None):
+        disk = {'serial': 'test', 'label': 'test', 'state': 'awake',
+                'smart': smart, 'smart_at': at, 'observed_at': at}
+        app.save(disk, previous or {})
+        return disk
+
+    def test_historical_result_does_not_invent_calendar_date(self):
+        self.save_read(self.smart(), 1000)
+        result = self.tracking()
+        self.assertEqual(result['last_result'], 'Completed without error')
+        self.assertEqual(result['last_result_power_on_hours'], 100)
+        self.assertEqual(result['result_source'], 'historical')
+        self.assertIsNone(result['last_observed_completed_at'])
+        self.assertNotIn('last_started_at', result)
+
+    def test_app_start_and_new_result_survive_restart(self):
+        smart = self.smart()
+        self.save_read(smart, 1000)
+        app.record_extended_start('test', smart, 1100)
+        app.initialize()
+        self.assertEqual(self.tracking()['last_started_at'], 1100)
+        self.assertEqual(self.tracking()['last_started_source'], 'app')
+        self.save_read(self.smart(hours=108), 5000)
+        result = self.tracking()
+        self.assertEqual(result['last_observed_completed_at'], 5000)
+        self.assertTrue(result['last_result_passed'])
+        self.assertNotIn('pending', result)
+
+    def test_old_result_does_not_complete_new_test(self):
+        smart = self.smart()
+        self.save_read(smart, 1000)
+        app.record_extended_start('test', smart, 1100)
+        self.save_read(smart, 1200)
+        self.assertIn('pending', self.tracking())
+        self.assertIsNone(self.tracking()['last_observed_completed_at'])
+
+    def test_observed_external_extended_test_records_observation_time(self):
+        self.save_read(self.smart(status='Self-test routine in progress', passed=None, running=True), 1000)
+        self.assertEqual(self.tracking()['last_started_source'], 'observed')
+        self.assertEqual(self.tracking()['last_started_at'], 1000)
+        self.save_read(self.smart(hours=108), 5000)
+        self.assertEqual(self.tracking()['last_observed_completed_at'], 5000)
+
+    def test_cached_sleeping_reading_does_not_advance_dates(self):
+        old = self.save_read(self.smart(), 1000)
+        cached = {**old, 'state': 'standby', 'observed_at': 6000}
+        app.save(cached, old)
+        self.assertEqual(self.tracking()['result_discovered_at'], 1000)
+        self.assertIsNone(self.tracking()['last_observed_completed_at'])
+
+    def test_short_tests_and_log_entry_renumbering_do_not_replace_long_result(self):
+        smart = self.smart()
+        self.save_read(smart, 1000)
+        smart['self_test_log']['standard']['table'][0]['num'] = 2
+        smart['self_test_log']['standard']['table'].insert(0, {
+            'type': {'value': 1, 'string': 'Short offline'},
+            'status': {'value': 0, 'string': 'Completed without error', 'passed': True},
+            'lifetime_hours': 101})
+        self.save_read(smart, 2000)
+        self.assertEqual(self.tracking()['result_discovered_at'], 1000)
+        self.assertEqual(self.tracking()['last_result_power_on_hours'], 100)
+
+    def test_aborted_result_is_not_treated_as_pass(self):
+        smart = self.smart()
+        app.record_extended_start('test', smart, 1000)
+        self.save_read(self.smart(hours=101, status='Aborted by host', passed=False), 2000)
+        self.assertFalse(self.tracking()['last_result_passed'])
+        self.assertEqual(self.tracking()['last_result'], 'Aborted by host')
+        self.assertEqual(self.tracking()['last_observed_completed_at'], 2000)
+
+    def test_failed_start_command_does_not_record_a_start(self):
+        config = {'serial': 'test'}
+        disk = {'serial': 'test', 'state': 'awake'}
+        data = {'ata_smart_data': {'self_test': {'status': {'value': 0}}}}
+        with patch('app.CONFIGS', [config]), patch('app.device_for', return_value='/dev/test'), patch('app.stored', return_value={}), patch('app.collect', return_value=disk), patch('app.save'), patch('app.smart_probe', return_value=data), patch('app.command', return_value=(2, '{}')), patch('app.record_extended_start') as record:
+            with self.assertRaisesRegex(ValueError, 'could not be started'):
+                app.execute_job({'action': 'test', 'serial': 'test', 'wake': False})
+            record.assert_not_called()
 
 
 if __name__ == '__main__':

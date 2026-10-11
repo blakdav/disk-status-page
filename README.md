@@ -158,7 +158,7 @@ smartd; host background monitoring remains separate from this container.
 
 ## Current validation
 
-Twenty-six unit tests pass, covering sleeping/unknown states, standby races,
+Thirty-five unit tests pass, covering sleeping/unknown states, standby races,
 unsupported SMART power checks, health warning bits, persisted transitions,
 observation gaps, and HTTP responses tested without sockets. Python compiles,
 YAML parses, and `docker compose config --quiet` passes. This development
@@ -314,3 +314,50 @@ Then add the Homepage example to the existing Homepage configuration.
 The GHCR workflow continues to publish `latest` and a commit-specific
 `sha-<full-commit-sha>` tag. If the package is private, authenticate on the
 NAS as described under Publishing before pulling.
+
+Disk cards and Homepage rows retain inventory order from `disks.json`,
+including during partial collection and individual disk actions. Database
+updates do not determine their display order.
+
+
+## Last extended self-test dates
+
+Each disk card shows the last recorded extended-test start, the last time
+an ended test was observed, and its result. Times use Pacific time and
+include the year. Tracking is saved in the existing SQLite volume, survives
+restarts, and is also available under each disk's `extended_test` field in
+both `/api/status` and `/api/homepage`.
+
+Successful app requests record their exact request timestamp. Tests found
+running in an explicitly extended SMART log entry receive a **First observed
+running** timestamp instead. Generic self-test execution status alone cannot
+establish whether an external test is short or extended, so the app does
+not infer an extended start from it.
+
+A new result is recorded when a fresh SMART read discovers it. This is an
+observation time, not the exact moment the drive finished. Failed and aborted
+tests remain distinct from successful ones. Old results discovered on first
+use are labeled **Historical result; calendar date unknown**, with the
+reported power-on hours; no calendar date is reconstructed from those hours.
+Cached readings while a disk sleeps do not advance these dates. Short tests
+do not replace the last extended result. A pending request retains the prior
+result until a distinguishable new extended result is observed.
+
+Tests started before this feature cannot acquire exact start dates
+retroactively. Two otherwise identical log entries at the same power-on hour
+may be indistinguishable; the app conservatively keeps the result pending
+instead of claiming completion. The app retains the latest tracking record
+per disk, rather than a complete calendar history of every test.
+
+This version automatically adds a tracking table without modifying existing
+disk history or acknowledgements. After publication, update on debian-nas:
+
+```bash
+cd /opt/docker/disk-status-page
+docker pull ghcr.io/blakdav/disk-status-page:latest
+docker compose up -d
+```
+
+No Compose or Ansible changes are needed. The existing GHCR workflow still
+publishes `latest` and a full-commit-specific tag. New tracking code has unit
+test coverage; live NAS and browser verification remain pending deployment.
