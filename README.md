@@ -158,7 +158,7 @@ smartd; host background monitoring remains separate from this container.
 
 ## Current validation
 
-Thirty-five unit tests pass, covering sleeping/unknown states, standby races,
+Thirty-six unit tests pass, covering sleeping/unknown states, standby races,
 unsupported SMART power checks, health warning bits, persisted transitions,
 observation gaps, and HTTP responses tested without sockets. Python compiles,
 YAML parses, and `docker compose config --quiet` passes. This development
@@ -361,3 +361,23 @@ docker compose up -d
 No Compose or Ansible changes are needed. The existing GHCR workflow still
 publishes `latest` and a full-commit-specific tag. New tracking code has unit
 test coverage; live NAS and browser verification remain pending deployment.
+
+
+Homepage disk descriptions include colored Unicode markers for power and
+health separately: green awake/healthy, blue sleeping, purple testing, red
+attention, yellow known issues, and neutral unknown/stale. Cached testing
+status on a sleeping or stale disk is explicitly labeled last-read testing
+with a neutral marker. Text remains present so color is never the only
+signal. These markers work with the existing `description` mapping; no custom
+Homepage image or CSS is required. Appearance depends on the browser font.
+Custom API does not support dynamic block highlighting; this does not change
+Homepage's text/background colors. Optional summary labels in the example
+use the same markers, serving as a static legend rather than a health alert.
+
+Homepage requests the API on load and every 30 seconds while its page is
+active, as configured by `refreshInterval: 30000`. The API reads the app's
+cache. Disk collection has its own 30-second Compose interval, so a state
+change can take roughly a minute to appear across both polling cycles.
+SMART health normally refreshes every 30 minutes on awake disks, and test
+status is refreshed each collection cycle once a running test is detected.
+Browser background throttling and command duration can delay updates.

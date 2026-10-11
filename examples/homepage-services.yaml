@@ -11,16 +11,16 @@
           refreshInterval: 30000
           mappings:
             - field: summary.awake
-              label: Awake
+              label: "🟢 Awake"
               format: number
             - field: summary.sleeping
-              label: Sleeping
+              label: "🔵 Sleeping"
               format: number
             - field: summary.attention
-              label: Attention
+              label: "🔴 Attention"
               format: number
             - field: summary.known_issues
-              label: Known issues
+              label: "🟡 Known issues"
               format: number
     # Optional detailed panel; requires a Homepage version supporting
     # Custom API dynamic-list. This lists every configured disk separately.

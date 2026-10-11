@@ -313,6 +313,25 @@ class HomepageAndAcknowledgementTests(unittest.TestCase):
                 self.assertEqual([d['label'] for d in app.homepage_status(payload)['disks']],
                                  ['data1', 'data2', 'parity1', 'data6'])
 
+    def test_homepage_markers_keep_power_health_and_testing_separate(self):
+        import time
+        disk = self.disk()
+        app.acknowledge_warning('test', 5, 200)
+        description = app.homepage_status(app.snapshot())['disks'][0]['description']
+        self.assertIn('🔵 Sleeping', description)
+        self.assertIn('🟡 Known issue', description)
+        disk.update(state='awake', smart_at=time.time())
+        disk['smart']['test_status'] = {'value': 249}
+        app.save(disk, {})
+        description = app.homepage_status(app.snapshot())['disks'][0]['description']
+        self.assertIn('🟢 Awake', description)
+        self.assertIn('🟣 Testing', description)
+        disk['state'] = 'standby'
+        app.save(disk, {})
+        description = app.homepage_status(app.snapshot())['disks'][0]['description']
+        self.assertIn('⚪ Last read: testing', description)
+        self.assertNotIn('🟣 Testing', description)
+
     def test_homepage_endpoint_returns_native_panel_shape(self):
         import io, json
         self.disk()
