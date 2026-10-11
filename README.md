@@ -128,10 +128,16 @@ every other capability dropped, that root can only write to a `/data` folder
 it owns: keep `/mnt/vault/apps/disk-status-page` owned by root, as Ansible
 creates it.
 
-The history mount uses `create_host_path: false`. `/mnt/vault` mounts with
-`nofail`, so Docker can start before it; the container then fails to start
-rather than writing history to an empty folder on the OS disk. Start it
-with `docker compose up -d` once the vault is mounted.
+`/mnt/vault` mounts with `nofail`, so Docker can start before it. Two
+safeguards keep history off the OS disk then. The history mount uses
+`create_host_path: false`, so a missing folder fails the start. And the app
+refuses to start unless `/data/.vault-marker` exists. The homelab NAS
+playbook (`--tags disk_status_setup`) creates that file only after checking
+`/mnt/vault` is mounted, so a folder under an unmounted vault never has it.
+The container exits and Docker's restart policy retries until the vault is
+mounted. Run that playbook before deploying an image with this check, or the
+app will not start. `DATA_MARKER` names the file; set it empty to disable
+the check. Demo mode skips it.
 
 Direct URL: http://172.23.24.16:8088. Configure Nginx Proxy Manager on the
 Docker VM to forward the chosen hostname to `172.23.24.16:8088`, enabling

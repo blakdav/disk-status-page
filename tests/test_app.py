@@ -531,3 +531,19 @@ class FreshnessTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DataMarkerTests(unittest.TestCase):
+    def test_missing_marker_refuses_to_start(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('app.DB', Path(directory) / 'history.sqlite3'):
+            with self.assertRaises(SystemExit):
+                app.require_data_marker()
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            (Path(directory) / '.vault-marker').touch()
+            app.require_data_marker()
+
+    def test_empty_marker_name_disables_check(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('app.DB', Path(directory) / 'history.sqlite3'), patch('app.DATA_MARKER', ''):
+            app.require_data_marker()

@@ -29,6 +29,11 @@ DEV_DIR = os.getenv('DEV_DIR', '/dev').rstrip('/')
 # requests addressed to one of these, which stops DNS rebinding: a foreign
 # page pointed at the NAS's IP still sends its own name as Host.
 ALLOWED_HOSTS = {h.strip().lower() for h in os.getenv('ALLOWED_HOSTS', '').split(',') if h.strip()}
+# Placed in the history folder by the host's provisioning, only after it has
+# checked the storage is mounted. Its absence means /data is not the intended
+# storage (for example an empty folder under an unmounted drive). Empty
+# disables the check.
+DATA_MARKER = os.getenv('DATA_MARKER', '.vault-marker')
 WARNINGS = {5, 187, 188, 197, 198, 199}
 COUNTERS = {4, 12, 193}
 # Acknowledge cumulative counters, never current pending/unreadable sectors.
@@ -38,6 +43,13 @@ ACTION_TOKEN = ''
 JOBS = queue.Queue(maxsize=1)
 JOB_LOCK = threading.Lock()
 JOB = None
+
+
+def require_data_marker():
+    if DATA_MARKER and not (DB.parent / DATA_MARKER).is_file():
+        raise SystemExit(f'{DB.parent / DATA_MARKER} is missing: the history storage is '
+                         'not mounted or not provisioned. Refusing to write history; '
+                         'Docker will retry.')
 
 
 def load_token():
@@ -825,6 +837,9 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     configs = json.loads(Path(os.getenv('DISKS_FILE', str(ROOT / 'disks.json'))).read_text())
+    # Before anything writes to /data. Demo history is disposable.
+    if not DEMO:
+        require_data_marker()
     initialize()
     CONFIGS = configs
     ACTION_TOKEN = '' if DEMO else load_token()

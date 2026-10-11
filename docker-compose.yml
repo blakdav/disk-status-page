@@ -34,8 +34,11 @@ services:
     volumes:
       # NVMe storage: recording history must not wake the monitored disks.
       # The vault mount is nofail, so Docker can start before it is mounted.
-      # create_host_path: false then fails the start instead of writing the
-      # history to an empty folder on the OS disk.
+      # create_host_path: false only refuses a missing folder; a folder that
+      # exists under the unmounted vault would still be used. So the app also
+      # requires the .vault-marker file that Ansible puts in this folder after
+      # checking the vault is mounted. Without it the app exits, and Docker
+      # retries (up to a minute apart) until the vault is mounted.
       - type: bind
         source: /mnt/vault/apps/disk-status-page
         target: /data
@@ -90,7 +93,8 @@ services:
           create_host_path: false
       # rslave: mergerfs is nofail too and may mount after the container
       # starts, or be remounted; without it the container keeps seeing the
-      # empty folder underneath.
+      # empty folder underneath. Relies on the host's / being a shared mount,
+      # which systemd sets up by default.
       - type: bind
         source: /mnt/pool
         target: /host/pool
