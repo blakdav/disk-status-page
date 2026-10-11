@@ -121,7 +121,7 @@ The app runs as root for disk queries; PUID/PGID are not supported.
 Direct URL: http://172.23.24.16:8088. Configure Nginx Proxy Manager on the
 Docker VM to forward the chosen hostname to `172.23.24.16:8088`, enabling
 HTTPS there. No Docker network shared across hosts is needed. The dashboard
-is readable without login. Actions require the generated NAS token. Keep
+is readable without login. Actions require clicking Unlock controls. Keep
 it on the trusted home network and use HTTPS through NPM for controls.
 
 Optional disk configuration override:
@@ -206,21 +206,16 @@ results after every action. It never assumes a command changed the disk's
 state. The latest action status is transient and resets on restart; disk
 history and health cache remain persistent.
 
-On first production startup, a random action token is saved at
-`/data/action-token` with mode 0600. Retrieve it locally on the NAS:
+Choose **Unlock controls** to enable action buttons. No password, token entry,
+or NAS command is required. **Lock controls** disables them again; reloading
+the page also locks them. Existing confirmations for spin-down and self-tests
+remain in place. Anyone who can access the dashboard can unlock its controls.
 
-```bash
-docker exec disk-status-page cat /data/action-token
-```
-
-Open the dashboard through your NPM HTTPS URL, choose **Unlock controls**,
-and enter the token. It is kept only in the page's memory, discarded on
-reload, and never embedded in repository files or returned by the public
-API. Use **Lock controls** when done. All action requests, including manual
-refresh, require it. Requests use POST with JSON, a custom token header and
-same-origin checks; cross-origin requests are not permitted. NPM must
-preserve the original Host header (its usual proxy configuration does).
-Do not share the token or put it into URL parameters.
+The server maintains an internal action capability at `/data/action-token`.
+The unlock button fetches it through a same-origin JSON POST and keeps it only
+in page memory. Action requests use a custom token header, JSON, and origin
+checks to reject cross-origin browser requests. This is a misclick guard, not
+user authentication. NPM must preserve the original Host header.
 
 ## Updating this version
 
@@ -494,3 +489,14 @@ Do not deploy capacity binds until the NAS pool is mounted.
 Host helper scripts now live in `/opt/docker/disk-status-page/host`, with their
 records in `/opt/docker/disk-status-page/status/snapraid`. NVMe history remains
 in `/mnt/vault/apps/disk-status-page`.
+
+
+### Missing capacity or SnapRAID data after an image update
+
+Pulling an image does not update Docker bind mounts. Merge this repository's
+Compose volumes into the NAS Compose file, preserving your local networks,
+then run `docker compose up -d`. The app needs the pool, disk mounts, timer
+files, lifecycle record directory, boot identity, and host mount/swap metadata.
+`docker inspect disk-status-page --format '{{json .Mounts}}'` shows the mounts
+actually supplied to the running container. Recording hooks must be installed
+with Ansible; completion history starts at the next recorded service run.

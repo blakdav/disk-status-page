@@ -40,3 +40,9 @@ class SyncStatusTests(unittest.TestCase):
         with patch('app.Path.read_text', side_effect=[
                 '{"state":"running","boot_id":"old"}', PermissionError()]):
             self.assertEqual(app.snapraid_status()['state'], 'unknown')
+
+    def test_missing_history_is_distinct_from_missing_mount(self):
+        for mounted, expected in [(False, 'Status mount missing'),
+                                  (True, 'Awaiting first recorded sync')]:
+            with patch('app.Path.read_text', side_effect=FileNotFoundError), patch('app.os.path.ismount', return_value=mounted):
+                self.assertEqual(app.snapraid_status()['state_label'], expected)

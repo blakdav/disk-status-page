@@ -6,7 +6,7 @@ const esc = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp
 const date = value => value ? new Date(value * 1000).toLocaleString('en-US', {timeZone:'America/Los_Angeles', month:'short', day:'numeric', hour:'numeric', minute:'2-digit', timeZoneName:'short'}) : 'Not observed yet';
 const bytes = n => Number.isFinite(n) ? (n / 2 ** 40).toFixed(2) + ' TiB' : '—';
 function capacityHtml(c, sleeping = false) {
-  if (!c || c.status !== 'available') return `<p>Capacity: ${esc(c?.status === 'unmounted' ? 'Unmounted' : 'Not available yet')}</p>`;
+  if (!c || c.status !== 'available') return `<p>Capacity: ${esc(c?.status === 'unmounted' ? 'Unmounted' : 'Not available yet')}</p>${c?.error ? `<p class="warning">${esc(c.error)}</p>` : ''}`;
   return `<dl><div><dt>Used</dt><dd>${bytes(c.used_bytes)}</dd></div><div><dt>Free</dt><dd>${bytes(c.free_bytes)}</dd></div><div><dt>Available</dt><dd>${bytes(c.available_bytes)}</dd></div></dl><p class="read-time">${sleeping || c.cached ? 'Cached · ' : ''}Capacity measured: ${date(c.observed_at)}</p>`;
 }
 function warningHtml(disk, enabled) {
@@ -31,12 +31,13 @@ function extendedTestHtml(disk) {
 function render(data) {
   latest = data;
   const sync = data.snapraid || {};
-  $('snapraid').innerHTML = `<h2>SnapRAID parity sync</h2><dl><div><dt>Current status</dt><dd>${esc(sync.state_label || 'Unavailable')}</dd></div><div><dt>Last finished</dt><dd>${esc(sync.finished_label || 'Not recorded')}</dd></div><div><dt>Last finished result</dt><dd>${esc(sync.result_label || 'Not recorded')}</dd></div><div><dt>Current / last start</dt><dd>${date(sync.started_at)}</dd></div></dl><p>Parity sync: ${esc(data.schedules?.sync?.label || 'Unavailable')}</p><p>Full parity scrub: ${esc(data.schedules?.scrub?.label || 'Unavailable')}</p><p>Tracks scheduled syncs and manual runs through snapraid-sync.service.</p>`;
+  $('snapraid').innerHTML = `<h2>SnapRAID parity sync</h2><dl><div><dt>Current status</dt><dd>${esc(sync.state_label || 'Unavailable')}</dd></div><div><dt>Last finished</dt><dd>${esc(sync.finished_label || 'Not recorded')}</dd></div><div><dt>Last finished result</dt><dd>${esc(sync.result_label || 'Not recorded')}</dd></div><div><dt>Current / last start</dt><dd>${date(sync.started_at)}</dd></div></dl>${sync.detail ? `<p class="read-time">${esc(sync.detail)}</p>` : ''}<p>Parity sync: ${esc(data.schedules?.sync?.label || 'Unavailable')}</p><p>Full parity scrub: ${esc(data.schedules?.scrub?.label || 'Unavailable')}</p><p>Tracks scheduled syncs and manual runs through snapraid-sync.service.</p>`;
   $('capacity').innerHTML = `<h2>Pool capacity</h2>${capacityHtml(data.pool)}<p>Available is mergerfs filesystem availability. Individual files must fit on a member disk; the pool creation policy also applies.</p>`;
   const busy = submitting || ['queued', 'running'].includes(data.job?.state);
   const enabled = data.controls_enabled && token && !busy;
   $('refresh').disabled = !enabled;
   $('unlock').disabled = !data.controls_enabled || busy;
+  $('unlock').textContent = token ? 'Lock controls' : 'Unlock controls';
   if (data.job) $('action-status').textContent = `${data.job.action}: ${data.job.message}`;
   $('demo').hidden = !data.demo;
   const disks = data.disks.map(d => ({...d, stale: data.server_time - d.observed_at > data.poll_seconds * 2.5}));
@@ -60,13 +61,23 @@ async function refresh() {
     $('connection').textContent = 'Disconnected · displayed values may be stale';
   }
 }
-$('unlock').addEventListener('click', () => {
+$('unlock').addEventListener('click', async () => {
   if (token) {
     token = '';
-    $('unlock').textContent = 'Unlock controls';
   } else {
-    token = prompt('Enter the NAS action token. It stays only in this page’s memory.')?.trim() || '';
-    $('unlock').textContent = token ? 'Lock controls' : 'Unlock controls';
+    $('unlock').disabled = true;
+    try {
+      const response = await fetch('/api/unlock', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'X-Requested-With': 'DiskStatusPage'},
+        body: '{}'
+      });
+      const result = await response.json();
+      if (!response.ok) throw Error(result.error || 'Could not unlock controls');
+      token = result.token;
+    } catch (error) {
+      $('action-status').textContent = error.message;
+    }
   }
   if (latest) render(latest);
 });

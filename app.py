@@ -381,6 +381,12 @@ def snapraid_status():
         if raw.get('finished_at'):
             result['finished_label'] = datetime.fromtimestamp(
                 raw['finished_at'], ZoneInfo('America/Los_Angeles')).strftime('%b %d, %Y %I:%M %p %Z')
+    except FileNotFoundError:
+        mounted = os.path.ismount('/host/snapraid')
+        result.update(state='unknown',
+                      state_label='Awaiting first recorded sync' if mounted else 'Status mount missing',
+                      detail='History begins with the next service run.' if mounted else
+                      'Add the SnapRAID status bind mount to Compose and recreate the container.')
     except (OSError, ValueError, TypeError, OverflowError):
         # Preserve historical information but never report an unverified run.
         result.update(state='unknown', state_label='Status unavailable')
@@ -398,7 +404,7 @@ def snapraid_schedules():
             schedules[kind] = {'calendar': calendars,
                                'label': '; '.join(labels.get(c, c) for c in calendars) or 'Not configured'}
         except OSError:
-            schedules[kind] = {'calendar': [], 'label': 'Unavailable'}
+            schedules[kind] = {'calendar': [], 'label': 'Timer file unavailable (check Compose mounts)'}
     return schedules
 
 
@@ -435,7 +441,7 @@ def pool_capacity(disks, now):
         row = db.execute("SELECT payload FROM metadata WHERE name='pool_capacity'").fetchone()
     result = json.loads(row[0]) if row else {'status': 'not_collected'}
     if not os.path.ismount('/host/pool'):
-        return {'status': 'unmounted'}
+        result = {'status': 'unavailable', 'error': 'Pool bind mount missing. Add /mnt/pool:/host/pool:ro to Compose and recreate the container.'}
     result['cached'] = now - result.get('observed_at', 0) > INTERVAL * 2
     for key in ('total', 'used', 'free', 'available'):
         value = result.get(key + '_bytes')
@@ -710,17 +716,28 @@ def run_collector(configs):
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        if self.path != '/api/action':
+        if self.path not in ('/api/action', '/api/unlock'):
             self.send_error(404)
             return
-        # JSON plus a custom authentication header prevents form-based CSRF;
+        # JSON plus a custom header prevents form-based cross-origin requests;
         # no CORS support is provided. Also reject foreign browser origins.
         origin = self.headers.get('Origin')
         same_origin = not origin or urlsplit(origin).netloc == self.headers.get('Host')
+        if self.path == '/api/unlock':
+            # This is a deliberate-click guard, not user authentication.
+            # Browsers cannot obtain the capability through a cross-origin POST.
+            if (DEMO or not ACTION_TOKEN or not same_origin
+                    or self.headers.get('Sec-Fetch-Site') == 'cross-site'
+                    or self.headers.get('Content-Type') != 'application/json'
+                    or self.headers.get('X-Requested-With') != 'DiskStatusPage'):
+                self.respond_json(403, {'error': 'Unlock from the dashboard'})
+                return
+            self.respond_json(200, {'token': ACTION_TOKEN})
+            return
         supplied = self.headers.get('X-Action-Token', '')
         if (DEMO or not ACTION_TOKEN or not same_origin
                 or not hmac.compare_digest(supplied, ACTION_TOKEN)):
-            self.respond_json(403, {'error': 'Unlock controls with the NAS action token'})
+            self.respond_json(403, {'error': 'Choose Unlock controls on the dashboard'})
             return
         try:
             if self.headers.get('Content-Type') != 'application/json':

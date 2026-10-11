@@ -4,7 +4,7 @@ services:
     container_name: disk-status-page
     restart: unless-stopped
     # Initial hardware-compatible configuration; reduce after NAS testing.
-    # This grants broad host access. Explicit disk actions require the generated action token.
+    # This grants broad host access. Explicit disk actions require clicking Unlock controls on the dashboard.
     privileged: true
     ports:
       - "8088:8080"
