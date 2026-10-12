@@ -160,6 +160,36 @@ rebinding (a foreign page pointing its own domain at the NAS). Add the NPM
 hostname when you set one up. If `ALLOWED_HOSTS` is empty, controls stay
 disabled. Reading the dashboard is unaffected.
 
+### Backup list
+
+The Backups section shows the NAS's backup jobs from `/config/backups.json`,
+which the homelab playbook writes beside `disks.json` (`backup_jobs` in
+`nas.yml`). Each job's systemd service runs a recorder before and after
+every run (`ExecStartPre`/`ExecStopPost`), which writes
+`status/backups/<id>.json`: start and end times, the result, and for restic
+jobs the new snapshot's summary. Compose mounts that folder read-only at
+`/host/backups`. The app never runs restic or rsync itself. Each entry:
+
+```json
+{"id": "vault-hetzner", "unit": "backup-restic-vault", "source": "Vault",
+ "destination": "Hetzner", "method": "restic", "max_age_hours": 26}
+```
+
+- `id`: the status file's name. `unit`: the systemd unit, whose `.timer`
+  supplies the schedule shown.
+- `source`, `destination`: shown as "source → destination"; `name`
+  (optional) replaces that.
+- `max_age_hours`: a job with no success for longer, and not running now,
+  is overdue.
+
+A job is a problem when its last run failed, a reboot cut it off, its
+record is unreadable, or it is overdue. Before its first recorded run it
+shows as waiting, which is not a problem. `/healthz/backups` turns red on
+any problem, and `/api/homepage` lists each job under `backups`. A missing
+or invalid list only empties the Backups section; disk monitoring carries
+on. [backups.example.json](backups.example.json) is used in demo mode;
+`BACKUPS_FILE` overrides the path.
+
 ### Disk list
 
 The image contains no disk list. The app reads `/config/disks.json`, which

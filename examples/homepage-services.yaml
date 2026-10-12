@@ -3,12 +3,15 @@
 # Replace NAS_ADDRESS with the NAS's address, and href with your NPM HTTPS
 # address if desired.
 #
-# Only two cards have a status dot. Homepage's dot can only be green (the
+# Only three cards have a status dot. Homepage's dot can only be green (the
 # URL answers with HTTP 403 or below) or red (above, or no answer):
 # - Disk Details: /healthz/disks is red if a disk needs attention, a disk
 #   is awake/asleep against its role, or the collector's data is stale.
 # - SnapRAID Sync: /healthz/sync is red if the last sync failed or was
 #   interrupted, its status can't be read, or none succeeded in 30 hours.
+# - Backups: /healthz/backups is red if any backup job's last run failed or
+#   was cut off by a reboot, its status can't be read, or it has had no
+#   success within its max_age_hours (unless it is running now).
 - Storage:
     - Disk Status:
         href: http://NAS_ADDRESS:8088
@@ -151,3 +154,19 @@
             - field: drives.scratch.temperature_label
               label: Temperature
               format: text
+    # One row per backup job, in the backup list's order, e.g.
+    # "Vault → Hetzner: OK · Oct 12, 2:14 AM · +1.2 GiB".
+    - Backups:
+        href: http://NAS_ADDRESS:8088
+        siteMonitor: http://NAS_ADDRESS:8088/healthz/backups
+        statusStyle: dot
+        widget:
+          type: customapi
+          url: http://NAS_ADDRESS:8088/api/homepage
+          refreshInterval: 30000
+          display: dynamic-list
+          mappings:
+            items: backups
+            name: name
+            label: description
+            limit: 10

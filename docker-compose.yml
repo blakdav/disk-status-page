@@ -89,6 +89,13 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # The same kind of records for each backup job, one file per job.
+      - type: bind
+        source: /opt/docker/disk-status-page/status/backups
+        target: /host/backups
+        read_only: true
+        bind:
+          create_host_path: false
       # Detect a run interrupted by NAS reboot instead of showing Running forever.
       - type: bind
         source: /proc/sys/kernel/random/boot_id

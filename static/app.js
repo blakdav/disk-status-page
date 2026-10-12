@@ -37,10 +37,24 @@ function nvmeCard(d, s, state, health, enabled) {
   const spare = Number.isFinite(w.available_spare) ? `${w.available_spare}% (threshold ${pct(w.available_spare_threshold)})` : '—';
   return `<article class="nvme"><div class="card-top"><div><h3>${esc(d.label)}</h3><p>${esc(d.role)} · NVMe</p></div><span class="badge ${esc(state)}">${esc(state === 'awake' ? 'Active' : state)}</span></div><p class="serial">${esc(d.serial)}</p><div class="wear"><div class="wear-label"><span>Endurance used</span><strong>${pct(w.percentage_used)}</strong></div><div class="meter" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${esc(w.percentage_used ?? 0)}" aria-label="Endurance used"><span style="width:${Math.min(100, Math.max(0, w.percentage_used || 0))}%"></span></div></div><dl><div><dt>SMART health</dt><dd>${health}</dd></div><div><dt>Spare capacity</dt><dd>${esc(spare)}</dd></div><div><dt>Data written</dt><dd>${tb(w.written_bytes)}</dd></div><div><dt>Power-on hours</dt><dd>${esc(w.power_on_hours?.toLocaleString())}</dd></div><div><dt>Media errors</dt><dd>${esc(w.media_errors)}</dd></div><div><dt>Unsafe shutdowns</dt><dd>${esc(w.unsafe_shutdowns?.toLocaleString())}</dd></div><div><dt>Temperature at last read</dt><dd>${s?.temperature != null ? esc(s.temperature) + ' °C' : '—'}</dd></div><div><dt>Time above warning temperature</dt><dd>${w.warning_temperature_minutes != null ? esc(w.warning_temperature_minutes) + ' min' : '—'}</dd></div></dl><p class="read-time">Health data retrieved: ${d.smart_at ? date(d.smart_at) : 'Not collected yet'}</p>${d.error ? `<p class="warning">${esc(d.error)}</p>` : ''}${warningHtml(d, enabled)}${capacityHtml(d.capacity)}<details><summary>Counters &amp; diagnostic logs</summary><pre>${esc(JSON.stringify({wear:w,io:d.io}, null, 2))}</pre></details></article>`;
 }
+// One card per backup job. The NAS's systemd hooks record each run; this
+// only shows what they wrote, plus whether the last success is too old.
+const BACKUP_BADGES = {ok: 'OK', running: 'Running', waiting: 'Waiting', problem: 'Problem', unknown: 'Unknown'};
+function backupsHtml(backups) {
+  if (!backups) return '<p>Backup status unavailable.</p>';
+  if (backups.error) return `<p class="warning">Backup list unreadable: ${esc(backups.error)}</p>`;
+  if (!backups.jobs.length) return '<p>No backup jobs configured.</p>';
+  return backups.jobs.map(j => {
+    const r = j.restic;
+    const restic = r ? `<div><dt>Last snapshot</dt><dd>${esc(r.snapshot_id)}</dd></div><div><dt>Data added</dt><dd>${esc(r.data_added_label)}</dd></div><div><dt>New / changed files</dt><dd>${esc(r.files_new?.toLocaleString())} / ${esc(r.files_changed?.toLocaleString())}</dd></div>` : '';
+    return `<article class="backup"><div class="card-top"><div><h3>${esc(j.name)}</h3><p>${esc(j.method || '')}${j.method ? ' · ' : ''}${esc(j.schedule_label)}</p></div><span class="badge ${esc(j.state)}">${esc(BACKUP_BADGES[j.state] || j.state)}</span></div>${j.problem ? `<p class="warning">${esc(j.problem)}</p>` : ''}<dl><div><dt>Status</dt><dd>${esc(j.state_label)}</dd></div><div><dt>Last success</dt><dd>${esc(j.last_success_label)}</dd></div><div><dt>Last run ended</dt><dd>${j.finished_at ? date(j.finished_at) : 'Not recorded'}</dd></div><div><dt>Last result</dt><dd>${esc(j.result_label)}</dd></div>${restic}</dl><p class="read-time">Overdue after ${esc(j.max_age_label)} without a success</p></article>`;
+  }).join('');
+}
 function render(data) {
   latest = data;
   const sync = data.snapraid || {};
   $('snapraid').innerHTML = `<h2>SnapRAID parity sync</h2><dl><div><dt>Current status</dt><dd>${esc(sync.state_label || 'Unavailable')}</dd></div><div><dt>Last finished</dt><dd>${esc(sync.finished_label || 'Not recorded')}</dd></div><div><dt>Last finished result</dt><dd>${esc(sync.result_label || 'Not recorded')}</dd></div><div><dt>Current / last start</dt><dd>${date(sync.started_at)}</dd></div></dl>${sync.detail ? `<p class="read-time">${esc(sync.detail)}</p>` : ''}<p>Parity sync: ${esc(data.schedules?.sync?.label || 'Unavailable')}</p><p>Full parity scrub: ${esc(data.schedules?.scrub?.label || 'Unavailable')}</p><p>Tracks scheduled syncs and manual runs through snapraid-sync.service.</p>`;
+  $('backups').innerHTML = backupsHtml(data.backups);
   $('capacity').innerHTML = `<h2>Pool capacity</h2>${capacityHtml(data.pool)}<p>Available is mergerfs filesystem availability. Individual files must fit on a member disk; the pool creation policy also applies.</p>`;
   const busy = submitting || ['queued', 'running'].includes(data.job?.state);
   const enabled = data.controls_enabled && token && !busy;

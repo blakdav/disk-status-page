@@ -42,6 +42,12 @@ COUNTERS = {4, 12, 193}
 # Acknowledge cumulative counters, never current pending/unreadable sectors.
 ACKNOWLEDGEABLE = {5, 187, 188, 199}
 CONFIGS = []
+# The backup jobs to show (config/backups.json, written by the NAS's
+# Ansible) and where their systemd hooks' records are mounted. Optional: a
+# missing or bad list only affects the Backups section.
+BACKUP_JOBS = []
+BACKUP_LIST_ERROR = None
+BACKUP_DIR = '/host/backups'
 # What a disk should be doing, from its configured role (a cold spare should
 # be asleep, a pool disk awake), and the power state that matches it.
 EXPECTED_STATES = {'awake': 'awake', 'asleep': 'standby'}
@@ -95,6 +101,35 @@ def load_configs(path):
                                               re.fullmatch(r'/host/[A-Za-z0-9_/-]+', config['capacity_path'])):
             raise ValueError(f'{config["label"]}: capacity_path must be a path under /host/')
     return configs
+
+
+def load_backup_jobs(path):
+    """Read the backup list and refuse a bad one."""
+    jobs = json.loads(Path(path).read_text())
+    if not isinstance(jobs, list):
+        raise ValueError('the backup list must be a JSON array')
+    ids = set()
+    for job in jobs:
+        if not isinstance(job, dict):
+            raise ValueError('each backup job must be a JSON object')
+        # ids name status files and units name timer files: no paths.
+        for key in ('id', 'unit'):
+            if not isinstance(job.get(key), str) or not re.fullmatch(r'[a-z0-9-]+', job[key]):
+                raise ValueError(f'each backup job needs a "{key}" of lowercase letters, digits and dashes')
+        if job['id'] in ids:
+            raise ValueError(f'backup job {job["id"]} is listed twice')
+        ids.add(job['id'])
+        for key in ('source', 'destination'):
+            if not isinstance(job.get(key), str) or not job[key].strip():
+                raise ValueError(f'{job["id"]}: needs a non-empty "{key}"')
+        if 'name' in job and (not isinstance(job['name'], str) or not job['name'].strip()):
+            raise ValueError(f'{job["id"]}: "name" must be non-empty text')
+        age = job.get('max_age_hours')
+        if isinstance(age, bool) or not isinstance(age, (int, float)) or age <= 0:
+            raise ValueError(f'{job["id"]}: max_age_hours must be a positive number')
+        if job.get('method') not in (None, 'restic', 'rsync'):
+            raise ValueError(f'{job["id"]}: method must be "restic" or "rsync"')
+    return jobs
 
 
 def require_data_marker():
@@ -497,26 +532,52 @@ def acknowledge_warning(serial, attribute_id, expected_raw, clear=False):
     return 'Current value acknowledged; increases will need attention again.'
 
 
-def snapraid_status():
-    """Read service lifecycle metadata only; never query the array."""
+def read_lifecycle(path):
+    """A systemd hook record (state, times, result), or ValueError if it is
+    malformed. Raises FileNotFoundError before the first recorded run."""
+    raw = json.loads(Path(path).read_text())
+    if not isinstance(raw, dict) or raw.get('state') not in ('running', 'idle'):
+        raise ValueError('Invalid lifecycle record')
+    for key in ('started_at', 'finished_at', 'last_success_at'):
+        value = raw.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                                  not 0 < value <= time.time() + 5):
+            raise ValueError('Invalid lifecycle timestamp')
+    return raw
+
+
+def interrupted(raw):
+    """A record still saying running from before the NAS last booted."""
+    boot = Path('/host/boot_id').read_text().strip()
+    return not boot or boot != raw.get('boot_id')
+
+
+def pacific(value, year=True):
     from datetime import datetime
     from zoneinfo import ZoneInfo
+    return datetime.fromtimestamp(value, ZoneInfo('America/Los_Angeles')).strftime(
+        '%b %d, %Y %I:%M %p %Z' if year else '%b %-d, %-I:%M %p')
+
+
+def bytes_label(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    for unit, power in (('TiB', 4), ('GiB', 3), ('MiB', 2), ('KiB', 1)):
+        if value >= 2 ** (10 * power):
+            return f'{value / 2 ** (10 * power):.1f} {unit}'
+    return f'{value:.0f} B'
+
+
+def snapraid_status():
+    """Read service lifecycle metadata only; never query the array."""
     result = {'state': 'unknown', 'state_label': 'Not recorded',
               'last_result': None, 'result_label': 'Not recorded',
               'finished_at': None, 'finished_label': 'Not recorded'}
     try:
-        raw = json.loads(Path('/host/snapraid/sync.json').read_text())
-        if not isinstance(raw, dict) or raw.get('state') not in ('running', 'idle'):
-            raise ValueError('Invalid sync record')
-        for key in ('started_at', 'finished_at', 'last_success_at'):
-            value = raw.get(key)
-            if value is not None and (not isinstance(value, (int, float)) or
-                                      not 0 < value <= time.time() + 5):
-                raise ValueError('Invalid sync timestamp')
+        raw = read_lifecycle('/host/snapraid/sync.json')
         result.update(raw)
         if raw['state'] == 'running':
-            boot = Path('/host/boot_id').read_text().strip()
-            if not boot or boot != raw.get('boot_id'):
+            if interrupted(raw):
                 result.update(state='interrupted', state_label='Interrupted by reboot')
             else:
                 result['state_label'] = 'Running'
@@ -526,8 +587,7 @@ def snapraid_status():
         result['result_label'] = ('Succeeded' if last == 'success' else
                                   'Not recorded' if last is None else f'Failed: {last}')
         if raw.get('finished_at'):
-            result['finished_label'] = datetime.fromtimestamp(
-                raw['finished_at'], ZoneInfo('America/Los_Angeles')).strftime('%b %d, %Y %I:%M %p %Z')
+            result['finished_label'] = pacific(raw['finished_at'])
     except FileNotFoundError:
         mounted = os.path.ismount('/host/snapraid')
         result.update(state='unknown', awaiting_first=mounted,
@@ -553,6 +613,112 @@ def snapraid_schedules():
         except OSError:
             schedules[kind] = {'calendar': [], 'label': 'Timer file unavailable (check Compose mounts)'}
     return schedules
+
+
+def calendar_label(calendar):
+    """Plain words for the OnCalendar forms the NAS uses; anything else
+    is shown as written."""
+    match = re.fullmatch(r'(?:(Mon|Tue|Wed|Thu|Fri|Sat|Sun) )?\*-\*-(\*|\d{2}) (\d{2}):(\d{2}):\d{2}(?: \S+)?', calendar)
+    if not match or (match[1] and match[2] != '*'):
+        return calendar
+    hour, minute = int(match[3]), match[4]
+    at = f'{(hour % 12) or 12}:{minute} {"AM" if hour < 12 else "PM"}'
+    days = {'Mon': 'Mondays', 'Tue': 'Tuesdays', 'Wed': 'Wednesdays', 'Thu': 'Thursdays',
+            'Fri': 'Fridays', 'Sat': 'Saturdays', 'Sun': 'Sundays'}
+    if match[1]:
+        return f'{days[match[1]]} at {at}'
+    if match[2] == '*':
+        return f'Daily at {at}'
+    return f'Monthly on day {int(match[2])} at {at}'
+
+
+def timer_label(unit):
+    try:
+        text = Path(f'/host/systemd/{unit}.timer').read_text()
+    except OSError:
+        return 'Timer file unavailable'
+    calendars = re.findall(r'^OnCalendar=(.+)$', text, re.MULTILINE)
+    return '; '.join(calendar_label(c.strip()) for c in calendars) or 'Not scheduled'
+
+
+def age_label(hours):
+    return f'{hours / 24:g} days' if hours >= 48 and hours % 24 == 0 else f'{hours:g} hours'
+
+
+def backup_job_status(job, mounted, now):
+    entry = {key: job.get(key) for key in ('id', 'source', 'destination', 'method', 'max_age_hours')}
+    entry.update(name=job.get('name') or f"{job['source']} → {job['destination']}",
+                 schedule_label=timer_label(job['unit']), problem=None, restic=None,
+                 max_age_label=age_label(job['max_age_hours']),
+                 result_label='Not recorded', last_success_label='Never',
+                 started_at=None, finished_at=None, last_success_at=None, last_result=None)
+    try:
+        raw = read_lifecycle(f"{BACKUP_DIR}/{job['id']}.json")
+    except FileNotFoundError:
+        # Only the first run creates the record; a missing mount is a fault.
+        entry.update(state='waiting' if mounted else 'unknown',
+                     state_label='Awaiting first run' if mounted else 'Status mount missing',
+                     problem=None if mounted else 'Status mount missing')
+        entry['description'] = entry['state_label']
+        return entry
+    except (OSError, ValueError, TypeError, OverflowError):
+        entry.update(state='unknown', state_label='Status unavailable', problem='Status unavailable')
+        entry['description'] = entry['state_label']
+        return entry
+    entry.update({key: raw.get(key) for key in ('started_at', 'finished_at', 'last_success_at', 'last_result')})
+    if isinstance(raw.get('restic'), dict):
+        restic = dict(raw['restic'])
+        restic['data_added_label'] = bytes_label(restic.get('data_added'))
+        entry['restic'] = restic
+    last = raw.get('last_result')
+    entry['result_label'] = ('Succeeded' if last == 'success' else
+                             'Not recorded' if last is None else f'Failed ({last})')
+    success = raw.get('last_success_at')
+    if success:
+        entry['last_success_label'] = pacific(success, year=False)
+    try:
+        lost = raw['state'] == 'running' and interrupted(raw)
+    except OSError:
+        lost = False
+    age = job['max_age_hours']
+    if lost:
+        entry.update(state='problem', state_label='Interrupted by a reboot',
+                     problem='Interrupted by a reboot')
+    elif raw['state'] == 'running':
+        # A run in progress is never overdue: the first PBS upload takes days.
+        entry.update(state='running', state_label='Running since ' + pacific(raw['started_at'], year=False)
+                     if raw.get('started_at') else 'Running')
+    elif last not in (None, 'success'):
+        entry.update(state='problem', state_label='Last run failed', problem=f'Last run failed ({last})')
+    elif not success or now - success > age * 3600:
+        entry.update(state='problem', state_label='Overdue', problem=f'No success in {age_label(age)}')
+    else:
+        entry.update(state='ok', state_label='OK')
+    if entry['state'] == 'running':
+        entry['description'] = entry['state_label']
+    elif entry['problem']:
+        entry['description'] = entry['problem'] + (f" · last success {entry['last_success_label']}" if success else '')
+    else:
+        added = (entry['restic'] or {}).get('data_added_label')
+        entry['description'] = f"OK · {entry['last_success_label']}" + (f' · +{added}' if added else '')
+    return entry
+
+
+def backup_status(now):
+    if BACKUP_LIST_ERROR:
+        return {'configured': False, 'error': BACKUP_LIST_ERROR, 'jobs': []}
+    mounted = os.path.isdir(BACKUP_DIR)
+    return {'configured': bool(BACKUP_JOBS), 'error': None,
+            'jobs': [backup_job_status(job, mounted, now) for job in BACKUP_JOBS]}
+
+
+def backups_health(backups):
+    """Healthy when every job ran recently and its last run succeeded, or it
+    is running, or has not had its first run yet."""
+    problems = [f"{job['name']}: {job['problem']}" for job in backups['jobs'] if job['problem']]
+    if backups.get('error'):
+        problems.append('Backup list unreadable: ' + backups['error'])
+    return {'ok': not problems, 'problems': problems}
 
 
 def filesystem_capacity(path, now):
@@ -629,7 +795,7 @@ def snapshot():
     return {'demo': DEMO, 'poll_seconds': INTERVAL, 'smart_seconds': SMART_INTERVAL,
             'server_time': now, 'disks': [decorate_disk(d, acknowledgements, now) for d in disks.values()], 'events': events,
             'schedules': snapraid_schedules(), 'pool': pool_capacity(list(disks.values()), now),
-            'snapraid': snapraid_status(), 'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN and ALLOWED_HOSTS) and not DEMO}
+            'snapraid': snapraid_status(), 'backups': backup_status(now), 'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN and ALLOWED_HOSTS) and not DEMO}
 
 
 def collector_freshness(payload):
@@ -769,7 +935,16 @@ def homepage_status(payload):
         if nvme:
             drives[disk['label']] = {**drive_card(disk), 'health': health,
                                      'issues_label': '; '.join(attention) or 'None'}
+    backups = payload.get('backups') or {'jobs': []}
+    backup_summary = {'total': len(backups['jobs']),
+                      **{state: sum(j['state'] == state for j in backups['jobs'])
+                         for state in ('ok', 'running', 'waiting', 'problem')}}
+    backup_summary['problem'] += sum(j['state'] == 'unknown' for j in backups['jobs'])
     return {'demo': payload['demo'], 'summary': summary, 'disks': disks, 'drives': drives,
+            'backups': [{'name': j['name'], 'state': j['state'], 'description': j['description']}
+                        for j in backups['jobs']],
+            'backup_summary': backup_summary,
+            'backups_health': backups_health(backups),
             'snapraid': payload.get('snapraid', {}),
             'schedules': payload.get('schedules', {}), 'pool': payload.get('pool', {}),
             'freshness': collector_freshness(payload),
@@ -975,10 +1150,10 @@ def run_collector(configs):
             next_poll = time.monotonic() + INTERVAL
 
 
-# /healthz: the collector is running (Docker's healthcheck). /healthz/disks
-# and /healthz/sync: for Homepage's status dots, which are green for an HTTP
+# /healthz: the collector is running (Docker's healthcheck). /healthz/disks,
+# /healthz/sync and /healthz/backups: for Homepage's status dots, which are green for an HTTP
 # status of 403 or below and red above it.
-HEALTH_PATHS = ('/healthz', '/healthz/disks', '/healthz/sync')
+HEALTH_PATHS = ('/healthz', '/healthz/disks', '/healthz/sync', '/healthz/backups')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1043,6 +1218,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/healthz/sync':
             result = sync_health(payload['snapraid'], payload['server_time'])
             return result['ok'], result
+        if path == '/healthz/backups':
+            result = backups_health(payload['backups'])
+            return result['ok'], result
         return None
 
     def do_HEAD(self):
@@ -1098,6 +1276,15 @@ if __name__ == '__main__':
         configs = load_configs(disks_file)
     except (OSError, ValueError) as exc:
         raise SystemExit(f'Cannot use disk list {disks_file}: {exc}')
+    backups_file = os.getenv('BACKUPS_FILE') or (
+        str(ROOT / 'backups.example.json') if DEMO else '/config/backups.json')
+    try:
+        BACKUP_JOBS = load_backup_jobs(backups_file)
+    except FileNotFoundError:
+        logging.info('No backup list at %s; the Backups section stays empty', backups_file)
+    except (OSError, ValueError) as exc:
+        BACKUP_LIST_ERROR = str(exc)
+        logging.error('Cannot use backup list %s: %s', backups_file, exc)
     # Before anything writes to /data. Demo history is disposable.
     if not DEMO:
         require_data_marker()

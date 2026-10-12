@@ -1,0 +1,7 @@
+[
+  {"id": "vault-hetzner", "unit": "backup-restic-vault", "source": "Vault", "destination": "Hetzner", "method": "restic", "max_age_hours": 26},
+  {"id": "vault-synology", "unit": "backup-mirror-vault", "source": "Vault", "destination": "Synology", "method": "rsync", "max_age_hours": 192},
+  {"id": "pbs-hetzner", "unit": "backup-restic-pbs", "source": "PBS datastore", "destination": "Hetzner", "method": "restic", "max_age_hours": 26},
+  {"id": "pbs-synology", "unit": "backup-mirror-pbs", "source": "PBS datastore", "destination": "Synology", "method": "rsync", "max_age_hours": 192},
+  {"id": "restic-maintenance", "unit": "backup-restic-maintain", "name": "Hetzner prune and check", "source": "Hetzner repository", "destination": "Prune and check", "method": "restic", "max_age_hours": 192}
+]

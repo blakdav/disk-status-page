@@ -20,3 +20,6 @@
 /* NVMe endurance: the drive's own estimate of rated writes consumed. */
 .wear{margin:18px 0 6px}.wear-label{display:flex;justify-content:space-between;font-size:12px;color:#99aaa2}.wear-label strong{color:#e5eee9;font-weight:500}
 .meter{height:6px;border-radius:3px;background:#25372c;margin-top:8px;overflow:hidden}.meter span{display:block;height:100%;background:#a6df8c;border-radius:3px}
+
+/* Backup job states. Problem is the one red: a failed, interrupted or overdue job. */
+.badge.ok{background:#2c4838;color:#b4e5a5}.badge.running{background:#293f46;color:#a4ced9}.badge.waiting{background:#30362f;color:#b9c4bd}.badge.problem{background:#4a2b2b;color:#f2aaa2}
