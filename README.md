@@ -27,10 +27,19 @@ disks, put unmounted spares in standby, or request extended SMART self-tests.
   counters and may reset after reboot; they do not identify a responsible app.
 - Stores only the latest SMART data per disk, not historical SMART trends.
 - Roles in the disk list describe intended usage, not actual mount status.
+- NVMe drives (`"type": "nvme"`) have no power states, so they get no
+  `hdparm` query, no transition history and no disk controls. Every 30
+  minutes the app reads their health log (`smartctl -d nvme`) and shows
+  endurance used, spare capacity, data written, media errors and time
+  spent above the warning temperature, plus their filesystem's capacity.
+  A drive needs attention on a critical warning bit, a failed health
+  check, any media error, spare at or below its threshold, or 80% of rated
+  endurance used. Error-log entries alone are not a warning: many drives
+  record harmless ones.
 
 Hardware compatibility and non-waking behavior through the JMicron
 controller remain to be validated on debian-nas. There is no fallback to
-an unrestricted SMART query. NVMe health and notifications are not included.
+an unrestricted SMART query. Notifications are not included.
 
 ## Local development
 
@@ -173,6 +182,12 @@ between the spare and pool lists there updates the dashboard. Each entry:
   and flagged in Homepage, without counting as needing attention: waking a
   spare on purpose is normal.
 - `allow_spindown`: whether the dashboard may put the disk to sleep.
+- `type`: `ata` (default) or `nvme`. An NVMe drive is found by
+  `/dev/disk/by-id/nvme-*_<serial>` and takes neither `expected_state` nor
+  `allow_spindown`.
+- `capacity_path`: where the container sees the disk's filesystem, under
+  `/host/` (optional). Pool disks default to `/host/disks/<label>`; the NVMe
+  drives use the `/host/mounts/` binds in the Compose file.
 
 [disks.example.json](disks.example.json) has placeholder disks, used by demo
 mode. `DISKS_FILE` overrides the path. Disk cards and Homepage rows keep the

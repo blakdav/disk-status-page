@@ -1,5 +1,19 @@
 [
   {
+    "label": "vault",
+    "role": "Vault",
+    "type": "nvme",
+    "serial": "EXAMPLE-NVME0",
+    "capacity_path": "/host/mounts/vault"
+  },
+  {
+    "label": "scratch",
+    "role": "Scratch",
+    "type": "nvme",
+    "serial": "EXAMPLE-NVME1",
+    "capacity_path": "/host/mounts/scratch"
+  },
+  {
     "label": "data1",
     "role": "Pool data",
     "serial": "EXAMPLE-DATA1",

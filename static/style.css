@@ -16,3 +16,7 @@
 
 /* A disk awake when it should sleep (or the reverse): worth a look, not an alarm. */
 .unexpected{font-size:12px;color:#a4ced9;border-left:2px solid #4f7f8c;padding-left:12px;margin:14px 0 0}
+
+/* NVMe endurance: the drive's own estimate of rated writes consumed. */
+.wear{margin:18px 0 6px}.wear-label{display:flex;justify-content:space-between;font-size:12px;color:#99aaa2}.wear-label strong{color:#e5eee9;font-weight:500}
+.meter{height:6px;border-radius:3px;background:#25372c;margin-top:8px;overflow:hidden}.meter span{display:block;height:100%;background:#a6df8c;border-radius:3px}

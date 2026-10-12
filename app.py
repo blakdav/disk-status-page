@@ -45,6 +45,20 @@ CONFIGS = []
 # What a disk should be doing, from its configured role (a cold spare should
 # be asleep, a pool disk awake), and the power state that matches it.
 EXPECTED_STATES = {'awake': 'awake', 'asleep': 'standby'}
+# ata: SATA disks behind the HBA, with power states and controls. nvme: the
+# NVMe drives, always active, monitored for health, wear and capacity only.
+DISK_TYPES = ('ata', 'nvme')
+# NVMe "percentage used" is the drive's own estimate of its rated endurance
+# consumed. It can pass 100; warn well before that.
+NVME_WEAR_WARNING = 80
+# NVMe critical warning bits (NVMe base specification, SMART/Health log).
+NVME_CRITICAL_BITS = (
+    (0, 'Spare capacity below threshold'),
+    (1, 'Temperature outside its safe range'),
+    (2, 'Reliability degraded by media or internal errors'),
+    (3, 'Drive switched to read-only'),
+    (4, 'Volatile memory backup failed'),
+)
 ACTION_TOKEN = ''
 JOBS = queue.Queue(maxsize=1)
 JOB_LOCK = threading.Lock()
@@ -71,6 +85,15 @@ def load_configs(path):
             raise ValueError(f'{config["label"]}: expected_state must be "awake" or "asleep"')
         if not isinstance(config.get('allow_spindown', False), bool):
             raise ValueError(f'{config["label"]}: allow_spindown must be true or false')
+        if config.get('type', 'ata') not in DISK_TYPES:
+            raise ValueError(f'{config["label"]}: type must be "ata" or "nvme"')
+        # NVMe drives never sleep and take no disk controls.
+        if config.get('type') == 'nvme' and (config.get('expected_state') or config.get('allow_spindown')):
+            raise ValueError(f'{config["label"]}: an NVMe drive has no expected power state or spin-down')
+        # Only a path under the container's read-only host mounts.
+        if 'capacity_path' in config and not (isinstance(config['capacity_path'], str) and
+                                              re.fullmatch(r'/host/[A-Za-z0-9_/-]+', config['capacity_path'])):
+            raise ValueError(f'{config["label"]}: capacity_path must be a path under /host/')
     return configs
 
 
@@ -122,9 +145,11 @@ def command(args):
     return result.returncode, result.stdout + result.stderr
 
 
-def device_for(serial):
+def device_for(serial, kind='ata'):
     # Resolve existing udev links only; discovery must never probe a disk.
-    candidates = glob.glob(DEV_DIR + '/disk/by-id/ata-*_' + glob.escape(serial))
+    # NVMe links also exist as <model>_<serial>_1 (namespace 1), which this
+    # pattern skips, as it does the eui.* links.
+    candidates = glob.glob(f'{DEV_DIR}/disk/by-id/{kind}-*_' + glob.escape(serial))
     return sorted(candidates)[0] if candidates else None
 
 
@@ -182,7 +207,76 @@ def summarize_smart(data, status):
             'test_status': data.get('ata_smart_data', {}).get('self_test', {}).get('status', {})}
 
 
+def summarize_nvme(data, status):
+    log = data.get('nvme_smart_health_information_log', {})
+    issues = []
+
+    def issue(key, message):
+        issues.append({'key': key, 'message': message})
+
+    critical = log.get('critical_warning') or 0
+    for bit, message in NVME_CRITICAL_BITS:
+        if critical & (1 << bit):
+            issue(f'critical:{bit}', message)
+    passed = data.get('smart_status', {}).get('passed')
+    if status & 8 or passed is False:
+        issue('health-failure', 'SMART overall health failure')
+    used = log.get('percentage_used')
+    if isinstance(used, int) and used >= NVME_WEAR_WARNING:
+        issue('wear', f'{used}% of rated endurance used')
+    spare, threshold = log.get('available_spare'), log.get('available_spare_threshold')
+    if isinstance(spare, int) and isinstance(threshold, int) and spare <= threshold:
+        issue('spare', f'Available spare {spare}% is at or below its {threshold}% threshold')
+    if log.get('media_errors'):
+        issue('media-errors', f"{log['media_errors']} media and data integrity errors")
+    # The error information log is deliberately not a warning: many drives
+    # record harmless entries there (unsupported commands from tools).
+    units = log.get('data_units_written')
+    return {'passed': passed, 'temperature': data.get('temperature', {}).get('current'),
+            'warnings': [i['message'] for i in issues], 'issues': issues,
+            'wear': {'percentage_used': used, 'available_spare': spare,
+                     'available_spare_threshold': threshold,
+                     # One data unit is 1,000 512-byte blocks.
+                     'written_bytes': units * 512000 if isinstance(units, int) else None,
+                     'power_on_hours': log.get('power_on_hours'),
+                     'unsafe_shutdowns': log.get('unsafe_shutdowns'),
+                     'media_errors': log.get('media_errors'),
+                     'error_log_entries': log.get('num_err_log_entries'),
+                     'warning_temperature_minutes': log.get('warning_temp_time'),
+                     'critical_temperature_minutes': log.get('critical_comp_time')}}
+
+
+def collect_nvme(config, previous, now, force_smart=False):
+    # NVMe drives have no standby to protect, so there is no power-state
+    # check; "awake" here means present and answering.
+    disk = {**previous, **config, 'observed_at': now, 'error': None}
+    path = device_for(config['serial'], 'nvme')
+    disk['device'] = path
+    disk['state'] = 'unknown'
+    if not path:
+        disk['error'] = 'Drive not found by serial; check device access and udev links.'
+        return disk
+    disk['state'] = 'awake'
+    try:
+        if force_smart or now - previous.get('smart_at', 0) >= SMART_INTERVAL:
+            code, output = command(['smartctl', '-d', 'nvme', '-a', '-j', path])
+            if code & 7:
+                disk['error'] = 'SMART read failed; cached values retained.'
+            else:
+                disk['smart'] = summarize_nvme(json.loads(output), code)
+                disk['smart_at'] = now
+        stat = Path('/sys/class/block') / Path(os.path.realpath(path)).name / 'stat'
+        if stat.exists():
+            values = stat.read_text().split()
+            disk['io'] = {'reads': int(values[0]), 'writes': int(values[4])}
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        disk['error'] = str(exc)
+    return refresh_capacity(config, disk, now)
+
+
 def collect(config, previous, now, force_smart=False):
+    if config.get('type') == 'nvme':
+        return collect_nvme(config, previous, now, force_smart)
     disk = {**previous, **config, 'observed_at': now, 'error': None}
     path = device_for(config['serial'])
     disk['device'] = path
@@ -480,7 +574,7 @@ def refresh_capacity(config, disk, now):
     label = config.get('label', '')
     if not re.fullmatch(r'[a-zA-Z0-9_-]+', label):
         return disk
-    path = '/host/disks/' + label
+    path = config.get('capacity_path') or '/host/disks/' + label
     if not os.path.ismount(path):
         disk['capacity'] = {'status': 'unmounted'}
     elif disk['state'] == 'awake':
@@ -592,8 +686,12 @@ def homepage_status(payload):
     disks = []
     for disk in payload['disks']:
         state = 'stale' if disk.get('stale') else disk.get('state', 'unknown')
-        state_label = {'awake': 'Awake', 'standby': 'Sleeping', 'unknown': 'Unknown', 'stale': 'Stale'}.get(state, 'Unknown')
-        summary[{'awake': 'awake', 'standby': 'sleeping'}.get(state, 'unknown')] += 1
+        nvme = disk.get('type') == 'nvme'
+        state_label = {'awake': 'Active' if nvme else 'Awake', 'standby': 'Sleeping',
+                       'unknown': 'Unknown', 'stale': 'Stale'}.get(state, 'Unknown')
+        # Awake and sleeping count spinning disks; an active NVMe drive is neither.
+        if not (nvme and state == 'awake'):
+            summary[{'awake': 'awake', 'standby': 'sleeping'}.get(state, 'unknown')] += 1
         summary['stale'] += int(bool(disk.get('stale')))
         summary['unexpected_state'] += int(bool(disk.get('unexpected_state')))
         summary['attention'] += int(disk['needs_attention'])
@@ -621,6 +719,9 @@ def homepage_status(payload):
         description = state_label
         if disk.get('unexpected_state'):
             description += f" (expected {disk['expected_state']})"
+        wear = smart.get('wear') or {}
+        if nvme and wear.get('percentage_used') is not None:
+            description += f" · {wear['percentage_used']}% worn"
         if disk.get('role'):
             description = f"{disk['role']} · {description}"
         if attention:
@@ -635,6 +736,7 @@ def homepage_status(payload):
                       'observed_at': disk.get('observed_at'),
                       'extended_test': disk.get('extended_test', {}),
                       'capacity': disk.get('capacity', {}),
+                      'type': disk.get('type', 'ata'), 'wear': wear,
                       'needs_attention': disk['needs_attention']})
     return {'demo': payload['demo'], 'summary': summary, 'disks': disks,
             'snapraid': payload.get('snapraid', {}),
@@ -656,6 +758,8 @@ def submit_job(action, serial=None, wake=False, attribute_id=None, expected_raw=
         raise ValueError('Unknown action')
     if action != 'refresh' and serial not in {c['serial'] for c in CONFIGS}:
         raise ValueError('Unknown disk serial')
+    if action != 'refresh' and any(c['serial'] == serial and c.get('type') == 'nvme' for c in CONFIGS):
+        raise ValueError('NVMe drives take no disk actions; Refresh disks reads their health')
     with JOB_LOCK:
         if JOB and JOB['state'] in ('queued', 'running'):
             raise ValueError('An action is already running; please wait')
@@ -815,10 +919,21 @@ def run_collector(configs):
             previous = stored()
             for i, config in enumerate(configs):
                 old = previous.get(config['serial'], {})
-                if DEMO:
+                if DEMO and config.get('type') == 'nvme':
                     now = time.time()
-                    disk = {**old, **config, 'observed_at': now, 'state': 'awake' if i < 3 else 'standby',
-                            'error': None, 'smart_at': now - (7200 if i >= 3 else 0),
+                    disk = {**old, **config, 'observed_at': now, 'state': 'awake', 'error': None,
+                            'smart_at': now, 'capacity': {'status': 'available', 'observed_at': now,
+                                                          'total_bytes': 2 * 10 ** 12, 'used_bytes': 12 * 10 ** 11,
+                                                          'free_bytes': 8 * 10 ** 11, 'available_bytes': 8 * 10 ** 11},
+                            'smart': summarize_nvme({'smart_status': {'passed': True}, 'temperature': {'current': 43},
+                                                     'nvme_smart_health_information_log': {
+                                                         'percentage_used': 2 + i, 'available_spare': 100,
+                                                         'available_spare_threshold': 10, 'data_units_written': 77769392,
+                                                         'power_on_hours': 5806, 'media_errors': 0}}, 0)}
+                elif DEMO:
+                    now = time.time()
+                    disk = {**old, **config, 'observed_at': now, 'state': 'standby' if config.get('expected_state') == 'asleep' else 'awake',
+                            'error': None, 'smart_at': now - (7200 if config.get('expected_state') == 'asleep' else 0),
                             'smart': {'passed': True, 'temperature': 32 + i, 'warnings': [],
                                       'counters': {'Start_Stop_Count': 120 + i, 'Load_Cycle_Count': 800 + i}}}
                 else:

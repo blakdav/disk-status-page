@@ -4,16 +4,19 @@ services:
     container_name: disk-status-page
     restart: unless-stopped
     # Not privileged. The app only needs to send ATA commands (power state,
-    # standby, SMART) to the SATA disks:
+    # standby, SMART) to the SATA disks, and read the NVMe drives' health log:
     # - SYS_RAWIO and SYS_ADMIN: the kernel requires both for the ATA ioctls
-    #   hdparm and smartctl use. Every other capability is dropped.
+    #   hdparm and smartctl use, and SYS_ADMIN for NVMe admin commands.
+    #   Every other capability is dropped.
     # - device_cgroup_rules: read-only opens of sd* disks (block major 8,
-    #   sda-sdp). No other host devices can be opened.
+    #   sda-sdp) and NVMe namespaces (block major 259). No other host
+    #   devices can be opened.
     # Docker's seccomp and AppArmor profiles stay in force.
     cap_drop: [ALL]
     cap_add: [SYS_RAWIO, SYS_ADMIN]
     device_cgroup_rules:
       - "b 8:* r"
+      - "b 259:* r"
     security_opt:
       - no-new-privileges:true
     # Only /data (and /tmp for SQLite scratch files) is writable.
@@ -108,6 +111,23 @@ services:
       - type: bind
         source: /mnt/pool
         target: /host/pool
+        read_only: true
+        bind:
+          propagation: rslave
+          create_host_path: false
+      # The NVMe drives' filesystems, for their capacity only (statfs). Each
+      # disk list entry with a capacity_path names one of these. rslave, as
+      # above: both mounts are nofail and may appear after the container.
+      - type: bind
+        source: /mnt/vault
+        target: /host/mounts/vault
+        read_only: true
+        bind:
+          propagation: rslave
+          create_host_path: false
+      - type: bind
+        source: /mnt/scratch
+        target: /host/mounts/scratch
         read_only: true
         bind:
           propagation: rslave
