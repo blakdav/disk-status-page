@@ -138,6 +138,27 @@ class NvmeConfigAndStatusTests(unittest.TestCase):
         self.assertEqual(disk['health'], 'Healthy')
         self.assertEqual(result['summary']['awake'], 0)
 
+    def test_homepage_drive_card_has_formatted_space_and_wear(self):
+        smart = app.summarize_nvme(health_log(), 0)
+        capacity = {'status': 'available', 'total_bytes': 2 * 2 ** 40, 'used_bytes': int(1.25 * 2 ** 40),
+                    'free_bytes': int(0.75 * 2 ** 40), 'available_bytes': 22 * 2 ** 30}
+        app.save({**NVME, 'state': 'awake', 'observed_at': time.time(), 'smart': smart,
+                  'smart_at': time.time(), 'capacity': capacity}, {})
+        with patch('app.CONFIGS', [NVME]):
+            card = app.homepage_status(app.snapshot())['drives']['vault']
+        self.assertEqual(card['used_label'], '1.25 TiB')
+        self.assertEqual(card['free_label'], '22 GiB')
+        self.assertEqual(card['used_percent_label'], '62%')
+        self.assertEqual(card['wear_label'], '2%')
+        self.assertEqual(card['temperature_label'], '43 °C')
+        self.assertEqual(card['written_label'], '39.8 TB')
+        self.assertEqual((card['health'], card['issues_label']), ('Healthy', 'None'))
+
+    def test_drive_card_without_data_says_unavailable(self):
+        with patch('app.CONFIGS', [NVME]):
+            card = app.homepage_status(app.snapshot())['drives']['vault']
+        self.assertEqual({card['used_label'], card['free_label'], card['wear_label']}, {'Unavailable'})
+
     def test_worn_drive_needs_attention(self):
         smart = app.summarize_nvme(health_log(percentage_used=90), 0)
         app.save({**NVME, 'state': 'awake', 'observed_at': time.time(), 'smart': smart}, {})

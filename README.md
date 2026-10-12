@@ -302,7 +302,9 @@ applicable, is described above.
 
 ## Homepage native panels and acknowledged warnings
 
-`GET /api/homepage` returns cached summary counts and per-disk descriptions.
+`GET /api/homepage` returns cached summary counts and per-disk descriptions,
+and under `drives.<label>` each NVMe drive's used and free space, percent
+full, wear, health and temperature as ready-to-show text.
 Homepage requests never query hardware, wake disks or initiate actions. This
 read-only endpoint needs no action token; do not put the control token in
 Homepage configuration.

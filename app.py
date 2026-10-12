@@ -679,11 +679,39 @@ def sync_health(sync, now):
     return {'ok': not problems, 'problems': problems}
 
 
+def size_label(value):
+    if not isinstance(value, (int, float)):
+        return 'Unavailable'
+    return f'{value / 2 ** 40:.2f} TiB' if value >= 2 ** 40 else f'{value / 2 ** 30:.0f} GiB'
+
+
+def drive_card(disk):
+    """One NVMe drive as ready-made text for a Homepage Custom API card,
+    which can show fields but not compute or format them."""
+    smart = disk.get('smart') or {}
+    wear = smart.get('wear') or {}
+    capacity = disk.get('capacity') or {}
+    measured = capacity.get('status') == 'available'
+    total, used = capacity.get('total_bytes'), capacity.get('used_bytes')
+    # Free is what df calls Avail: space a new file can actually use.
+    return {'used_label': size_label(used) if measured else 'Unavailable',
+            'free_label': size_label(capacity.get('available_bytes')) if measured else 'Unavailable',
+            'total_label': size_label(total) if measured else 'Unavailable',
+            'used_percent_label': f'{used / total:.0%}' if measured and total else 'Unavailable',
+            'wear_label': (f"{wear['percentage_used']}%" if wear.get('percentage_used') is not None
+                           else 'Unavailable'),
+            'temperature_label': (f"{smart['temperature']} °C" if smart.get('temperature') is not None
+                                  else 'Unavailable'),
+            'written_label': (f"{wear['written_bytes'] / 10 ** 12:.1f} TB" if wear.get('written_bytes') is not None
+                              else 'Unavailable')}
+
+
 def homepage_status(payload):
     summary = {'total': len(payload['disks']), 'awake': 0, 'sleeping': 0,
                'unknown': 0, 'attention': 0, 'known_issues': 0, 'health_unknown': 0,
                'tests_running': 0, 'stale': 0, 'unexpected_state': 0}
     disks = []
+    drives = {}
     for disk in payload['disks']:
         state = 'stale' if disk.get('stale') else disk.get('state', 'unknown')
         nvme = disk.get('type') == 'nvme'
@@ -738,7 +766,10 @@ def homepage_status(payload):
                       'capacity': disk.get('capacity', {}),
                       'type': disk.get('type', 'ata'), 'wear': wear,
                       'needs_attention': disk['needs_attention']})
-    return {'demo': payload['demo'], 'summary': summary, 'disks': disks,
+        if nvme:
+            drives[disk['label']] = {**drive_card(disk), 'health': health,
+                                     'issues_label': '; '.join(attention) or 'None'}
+    return {'demo': payload['demo'], 'summary': summary, 'disks': disks, 'drives': drives,
             'snapraid': payload.get('snapraid', {}),
             'schedules': payload.get('schedules', {}), 'pool': payload.get('pool', {}),
             'freshness': collector_freshness(payload),

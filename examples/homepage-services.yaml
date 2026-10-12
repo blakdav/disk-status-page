@@ -1,6 +1,7 @@
 # Merge this group into Homepage's services.yaml.
 # GET reads cached observations only; do not configure POST /api/action here.
-# Replace href with your NPM HTTPS address if desired.
+# Replace NAS_ADDRESS with the NAS's address, and href with your NPM HTTPS
+# address if desired.
 #
 # Only two cards have a status dot. Homepage's dot can only be green (the
 # URL answers with HTTP 403 or below) or red (above, or no answer):
@@ -10,11 +11,11 @@
 #   interrupted, its status can't be read, or none succeeded in 30 hours.
 - Storage:
     - Disk Status:
-        href: http://172.23.24.16:8088
+        href: http://NAS_ADDRESS:8088
         description: NAS disk state and health
         widget:
           type: customapi
-          url: http://172.23.24.16:8088/api/homepage
+          url: http://NAS_ADDRESS:8088/api/homepage
           refreshInterval: 30000
           display: list
           mappings:
@@ -36,26 +37,26 @@
     # state, flags a state its role does not expect, and lists only
     # unacknowledged issues, e.g. "Cold spare · Awake (expected asleep)".
     - Disk Details:
-        href: http://172.23.24.16:8088
-        siteMonitor: http://172.23.24.16:8088/healthz/disks
+        href: http://NAS_ADDRESS:8088
+        siteMonitor: http://NAS_ADDRESS:8088/healthz/disks
         statusStyle: dot
         widget:
           type: customapi
-          url: http://172.23.24.16:8088/api/homepage
+          url: http://NAS_ADDRESS:8088/api/homepage
           refreshInterval: 30000
           display: dynamic-list
           mappings:
             items: disks
             name: label
             label: description
-            limit: 8
+            limit: 10
     - SnapRAID Sync:
-        href: http://172.23.24.16:8088
-        siteMonitor: http://172.23.24.16:8088/healthz/sync
+        href: http://NAS_ADDRESS:8088
+        siteMonitor: http://NAS_ADDRESS:8088/healthz/sync
         statusStyle: dot
         widget:
           type: customapi
-          url: http://172.23.24.16:8088/api/homepage
+          url: http://NAS_ADDRESS:8088/api/homepage
           refreshInterval: 30000
           display: list
           mappings:
@@ -75,10 +76,10 @@
               label: Scrub schedule
               format: text
     - Pool Capacity:
-        href: http://172.23.24.16:8088
+        href: http://NAS_ADDRESS:8088
         widget:
           type: customapi
-          url: http://172.23.24.16:8088/api/homepage
+          url: http://NAS_ADDRESS:8088/api/homepage
           refreshInterval: 30000
           mappings:
             - field: pool.total_label
@@ -92,4 +93,61 @@
               format: text
             - field: pool.available_label
               label: Available
+              format: text
+    # One card per NVMe drive, from the drives section of /api/homepage
+    # (keyed by the drive's label in the disk list). Free is space a new
+    # file can use, as df's Avail; wear is the drive's own estimate of its
+    # rated endurance used. Health reads Needs attention on any problem;
+    # Issues says which.
+    - Vault NVMe:
+        href: http://NAS_ADDRESS:8088
+        widget:
+          type: customapi
+          url: http://NAS_ADDRESS:8088/api/homepage
+          refreshInterval: 30000
+          display: list
+          mappings:
+            - field: drives.vault.used_label
+              label: Used
+              format: text
+            - field: drives.vault.free_label
+              label: Free
+              format: text
+            - field: drives.vault.used_percent_label
+              label: Full
+              format: text
+            - field: drives.vault.wear_label
+              label: Wear
+              format: text
+            - field: drives.vault.health
+              label: Health
+              format: text
+            - field: drives.vault.temperature_label
+              label: Temperature
+              format: text
+    - Scratch NVMe:
+        href: http://NAS_ADDRESS:8088
+        widget:
+          type: customapi
+          url: http://NAS_ADDRESS:8088/api/homepage
+          refreshInterval: 30000
+          display: list
+          mappings:
+            - field: drives.scratch.used_label
+              label: Used
+              format: text
+            - field: drives.scratch.free_label
+              label: Free
+              format: text
+            - field: drives.scratch.used_percent_label
+              label: Full
+              format: text
+            - field: drives.scratch.wear_label
+              label: Wear
+              format: text
+            - field: drives.scratch.health
+              label: Health
+              format: text
+            - field: drives.scratch.temperature_label
+              label: Temperature
               format: text
