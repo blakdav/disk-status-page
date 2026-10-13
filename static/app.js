@@ -50,11 +50,19 @@ function backupsHtml(backups) {
     return `<article class="backup"><div class="card-top"><div><h3>${esc(j.name)}</h3><p>${esc(j.method || '')}${j.method ? ' · ' : ''}${esc(j.schedule_label)}</p></div><span class="badge ${esc(j.state)}">${esc(BACKUP_BADGES[j.state] || j.state)}</span></div>${j.problem ? `<p class="warning">${esc(j.problem)}</p>` : ''}<dl><div><dt>Status</dt><dd>${esc(j.state_label)}</dd></div><div><dt>Last success</dt><dd>${esc(j.last_success_label)}</dd></div><div><dt>Last run ended</dt><dd>${j.finished_at ? date(j.finished_at) : 'Not recorded'}</dd></div><div><dt>Last result</dt><dd>${esc(j.result_label)}</dd></div>${restic}</dl><p class="read-time">Overdue after ${esc(j.max_age_label)} without a success</p></article>`;
   }).join('');
 }
+// The Synology logs only its wakes, each with when the disks had gone to
+// sleep, so between wakes its current state is unknown.
+function synologyHtml(s) {
+  const rows = s.wakes.map(w => `<li><time>${esc(w.woke_label)}</time><strong>Woke</strong>${w.slept_label ? `asleep since ${esc(w.slept_label)} · ${esc(w.asleep_label)}` : 'sleep start unknown'}</li>`).join('') || '<li>No wakes recorded yet.</li>';
+  return `<h2>Synology disk sleep</h2><dl><div><dt>Last wake</dt><dd>${esc(s.last_wake_label)}</dd></div><div><dt>Asleep before it</dt><dd>${esc(s.last_asleep_label)}</dd></div><div><dt>Wakes, last 24 hours</dt><dd>${esc(s.wakes_24h)}</dd></div><div><dt>Wakes, last 7 days</dt><dd>${esc(s.wakes_7d)}</dd></div><div><dt>Last log line received</dt><dd>${s.last_line_at ? date(s.last_line_at) : 'None yet'}</dd></div></dl><p>From the Synology's own log, forwarded as it is written. It records each wake and when the disks had gone to sleep; nothing arrives while they sleep.</p><ol>${rows}</ol>`;
+}
 function render(data) {
   latest = data;
   const sync = data.snapraid || {};
   $('snapraid').innerHTML = `<h2>SnapRAID parity sync</h2><dl><div><dt>Current status</dt><dd>${esc(sync.state_label || 'Unavailable')}</dd></div><div><dt>Last finished</dt><dd>${esc(sync.finished_label || 'Not recorded')}</dd></div><div><dt>Last finished result</dt><dd>${esc(sync.result_label || 'Not recorded')}</dd></div><div><dt>Current / last start</dt><dd>${date(sync.started_at)}</dd></div></dl>${sync.detail ? `<p class="read-time">${esc(sync.detail)}</p>` : ''}<p>Parity sync: ${esc(data.schedules?.sync?.label || 'Unavailable')}</p><p>Full parity scrub: ${esc(data.schedules?.scrub?.label || 'Unavailable')}</p><p>Tracks scheduled syncs and manual runs through snapraid-sync.service.</p>`;
   $('backups').innerHTML = backupsHtml(data.backups);
+  $('synology').hidden = !data.synology?.configured;
+  if (data.synology?.configured) $('synology').innerHTML = synologyHtml(data.synology);
   $('capacity').innerHTML = `<h2>Pool capacity</h2>${capacityHtml(data.pool)}<p>Available is mergerfs filesystem availability. Individual files must fit on a member disk; the pool creation policy also applies.</p>`;
   const busy = submitting || ['queued', 'running'].includes(data.job?.state);
   const enabled = data.controls_enabled && token && !busy;

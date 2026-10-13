@@ -5,6 +5,7 @@ import json
 import hmac
 import secrets
 import queue
+import socket
 from urllib.parse import urlsplit
 import logging
 import os
@@ -14,6 +15,8 @@ import sqlite3
 import subprocess
 import threading
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).parent
@@ -48,6 +51,21 @@ CONFIGS = []
 BACKUP_JOBS = []
 BACKUP_LIST_ERROR = None
 BACKUP_DIR = '/host/backups'
+# The Synology's disk sleep log. Its syslog-ng forwards scemd's lines here
+# over UDP (README: "Synology disk sleep"); only these addresses are heard.
+# Empty turns the listener off. A wake writes, for example:
+#   2026-10-13T15:19:22-05:00 DiskStation scemd[11897]: event_disk_hibernation_handler.c:47
+#   The internal disks wake up, hibernate from [Oct 12 11:35:23]
+# Nothing is logged when the disks go to sleep; the bracketed time says when
+# they did. It has no zone or year: it is the Synology's local time
+# (SYNOLOGY_TZ), while the line's own stamp carries its offset.
+SYNOLOGY_ADDRESSES = {a.strip() for a in os.getenv('SYNOLOGY_ADDRESS', '').split(',') if a.strip()}
+SYNOLOGY_PORT = int(os.getenv('SYNOLOGY_SYSLOG_PORT', '5140'))
+SYNOLOGY_TZ = os.getenv('SYNOLOGY_TZ', 'America/Los_Angeles')
+SYNOLOGY_LINE = re.compile(r'(?:<\d+>)?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:[+-]\d\d:\d\d|Z)) '
+                           r'\S+ scemd(?:\[\d+\])?: (.*)')
+SYNOLOGY_WAKE = re.compile(r'The internal disks wake up, hibernate from \[([A-Z][a-z]{2} +\d{1,2} \d\d:\d\d:\d\d)\]')
+SYNOLOGY_RETENTION = 400 * 86400
 # What a disk should be doing, from its configured role (a cold spare should
 # be asleep, a pool disk awake), and the power state that matches it.
 EXPECTED_STATES = {'awake': 'awake', 'asleep': 'standby'}
@@ -173,6 +191,8 @@ def initialize():
                    'acknowledged_at REAL, PRIMARY KEY(serial, attribute_id))')
         db.execute('CREATE TABLE IF NOT EXISTS extended_tests '
                    '(serial TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+        db.execute('CREATE TABLE IF NOT EXISTS synology_wakes '
+                   '(woke_at REAL PRIMARY KEY, slept_at REAL)')
 
 
 def command(args):
@@ -721,6 +741,105 @@ def backups_health(backups):
     return {'ok': not problems, 'problems': problems}
 
 
+def parse_synology_line(line):
+    """(logged_at, wake) for one forwarded scemd line, or None for anything
+    else. wake is None for other scemd lines, else (woke_at, slept_at), with
+    slept_at None if the bracketed time can't be placed before the wake."""
+    match = SYNOLOGY_LINE.fullmatch(line.strip())
+    if not match:
+        return None
+    try:
+        logged = datetime.fromisoformat(match[1])
+    except ValueError:
+        return None
+    wake = SYNOLOGY_WAKE.search(match[2])
+    if not wake:
+        return logged.timestamp(), None
+    woke_at = logged.timestamp()
+    zone = ZoneInfo(SYNOLOGY_TZ)
+    local = datetime.fromtimestamp(woke_at, zone)
+    try:
+        slept = datetime.strptime(f'{local.year} {wake[1]}', '%Y %b %d %H:%M:%S')
+        # A wake in January may follow a sleep that began in December.
+        if slept.month > local.month:
+            slept = slept.replace(year=local.year - 1)
+        slept_at = slept.replace(tzinfo=zone).timestamp()
+    except ValueError:
+        slept_at = None
+    if slept_at is not None and not 0 <= woke_at - slept_at <= 366 * 86400:
+        slept_at = None
+    return woke_at, (woke_at, slept_at)
+
+
+def record_synology_line(line, now):
+    """Store a forwarded line's wake, if it has one. True if it was a scemd line."""
+    parsed = parse_synology_line(line)
+    if not parsed:
+        return False
+    logged_at, wake = parsed
+    if logged_at > now + 300:
+        return False
+    with connect() as db:
+        db.execute("INSERT INTO metadata VALUES ('synology', ?) "
+                   "ON CONFLICT(name) DO UPDATE SET payload=excluded.payload",
+                   (json.dumps({'last_line_at': logged_at, 'last_received_at': now}),))
+        if wake:
+            # Resent or replayed lines are ignored: one wake per moment.
+            db.execute('INSERT OR IGNORE INTO synology_wakes VALUES (?, ?)', wake)
+            db.execute('DELETE FROM synology_wakes WHERE woke_at < ?', (now - SYNOLOGY_RETENTION,))
+    return True
+
+
+def run_synology_listener(sock):
+    refused = set()
+    while not STOP.is_set():
+        try:
+            data, (host, _) = sock.recvfrom(4096)
+        except OSError:
+            if sock.fileno() == -1:
+                return
+            continue
+        if host not in SYNOLOGY_ADDRESSES:
+            if host not in refused and len(refused) < 50:
+                refused.add(host)
+                logging.warning('Ignoring syslog from %s: not in SYNOLOGY_ADDRESS', host)
+            continue
+        for line in data.decode('utf-8', 'replace').splitlines():
+            try:
+                record_synology_line(line, time.time())
+            except (sqlite3.Error, ValueError, OverflowError):
+                logging.exception('Could not record Synology log line')
+
+
+def duration_label(seconds):
+    minutes = int(seconds // 60)
+    days, minutes = divmod(minutes, 1440)
+    hours, minutes = divmod(minutes, 60)
+    return (f'{days}d {hours}h' if days else f'{hours}h {minutes}m' if hours else f'{minutes}m')
+
+
+def synology_status(now):
+    if not SYNOLOGY_ADDRESSES:
+        return {'configured': False}
+    with connect() as db:
+        rows = db.execute('SELECT woke_at, slept_at FROM synology_wakes '
+                          'ORDER BY woke_at DESC LIMIT 30').fetchall()
+        day, week = (db.execute('SELECT COUNT(*) FROM synology_wakes WHERE woke_at > ?',
+                                (now - span,)).fetchone()[0] for span in (86400, 7 * 86400))
+        meta = db.execute("SELECT payload FROM metadata WHERE name='synology'").fetchone()
+    meta = json.loads(meta[0]) if meta else {}
+    wakes = [{'woke_at': woke, 'slept_at': slept,
+              'woke_label': pacific(woke, year=False),
+              'slept_label': pacific(slept, year=False) if slept else None,
+              'asleep_label': duration_label(woke - slept) if slept else None}
+             for woke, slept in rows]
+    last = wakes[0] if wakes else None
+    return {'configured': True, 'wakes': wakes, 'wakes_24h': day, 'wakes_7d': week,
+            'last_line_at': meta.get('last_line_at'),
+            'last_wake_label': last['woke_label'] if last else 'None recorded',
+            'last_asleep_label': (last['asleep_label'] or 'Unknown') if last else 'None recorded'}
+
+
 def filesystem_capacity(path, now):
     # Reject an absent mount: never accidentally report the container OS disk.
     if not os.path.ismount(path):
@@ -795,7 +914,8 @@ def snapshot():
     return {'demo': DEMO, 'poll_seconds': INTERVAL, 'smart_seconds': SMART_INTERVAL,
             'server_time': now, 'disks': [decorate_disk(d, acknowledgements, now) for d in disks.values()], 'events': events,
             'schedules': snapraid_schedules(), 'pool': pool_capacity(list(disks.values()), now),
-            'snapraid': snapraid_status(), 'backups': backup_status(now), 'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN and ALLOWED_HOSTS) and not DEMO}
+            'snapraid': snapraid_status(), 'backups': backup_status(now),
+            'synology': synology_status(now), 'job': job_snapshot(), 'controls_enabled': bool(ACTION_TOKEN and ALLOWED_HOSTS) and not DEMO}
 
 
 def collector_freshness(payload):
@@ -872,6 +992,19 @@ def drive_card(disk):
                               else 'Unavailable')}
 
 
+def synology_card(synology):
+    """The Synology's sleep history as ready-made text for a Homepage card."""
+    if not synology.get('configured'):
+        return {'configured': False, 'description': 'Not set up'}
+    last = synology['wakes'][0] if synology['wakes'] else None
+    description = (f"Woke {last['woke_label']}" + (f" after {last['asleep_label']} asleep" if last['asleep_label'] else '')
+                   if last else 'No wakes recorded yet')
+    return {'configured': True, 'description': description,
+            'last_wake_label': synology['last_wake_label'],
+            'last_asleep_label': synology['last_asleep_label'],
+            'wakes_24h': synology['wakes_24h'], 'wakes_7d': synology['wakes_7d']}
+
+
 def homepage_status(payload):
     summary = {'total': len(payload['disks']), 'awake': 0, 'sleeping': 0,
                'unknown': 0, 'attention': 0, 'known_issues': 0, 'health_unknown': 0,
@@ -944,6 +1077,7 @@ def homepage_status(payload):
             'backups': [{'name': j['name'], 'state': j['state'], 'description': j['description']}
                         for j in backups['jobs']],
             'backup_summary': backup_summary,
+            'synology': synology_card(payload.get('synology') or {'configured': False}),
             'backups_health': backups_health(backups),
             'snapraid': payload.get('snapraid', {}),
             'schedules': payload.get('schedules', {}), 'pool': payload.get('pool', {}),
@@ -1299,4 +1433,9 @@ if __name__ == '__main__':
         except Exception:
             logging.exception('Collector stopped; health endpoint will become unhealthy')
     threading.Thread(target=worker, daemon=True).start()
+    if SYNOLOGY_ADDRESSES and not DEMO:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listener.bind(('0.0.0.0', SYNOLOGY_PORT))
+        threading.Thread(target=run_synology_listener, args=(listener,), daemon=True).start()
+        logging.info('Listening for the Synology\'s disk log on UDP %d', SYNOLOGY_PORT)
     ThreadingHTTPServer(('0.0.0.0', int(os.getenv('PORT', '8080'))), Handler).serve_forever()

@@ -190,6 +190,62 @@ or invalid list only empties the Backups section; disk monitoring carries
 on. [backups.example.json](backups.example.json) is used in demo mode;
 `BACKUPS_FILE` overrides the path.
 
+### Synology disk sleep
+
+The Synology's disks sleep after its HDD hibernation timer, and DSM's
+`scemd` logs each wake to `/var/log/scemd.log`:
+
+```
+2026-10-13T15:19:22-05:00 DiskStation scemd[11897]: event_disk_hibernation_handler.c:47 The internal disks wake up, hibernate from [Oct 12 11:35:23]
+```
+
+DSM writes nothing when the disks go to sleep; the bracketed time on the
+next wake says when they did. It has no year or zone: it is in the time
+zone set in DSM (`SYNOLOGY_TZ`, default `America/Los_Angeles`). The line's
+own stamp carries its offset, which can differ from the bracket's until
+syslog-ng restarts after a time zone change.
+
+The Synology's syslog-ng forwards these lines to the app over UDP as it
+writes them. Nothing polls the Synology: an SSH login there writes to its
+system partition, which is on every disk, so checking would keep them
+awake. UDP rather than TCP so that, while the app is down, syslog-ng
+doesn't log connection errors, which would wake the disks too. Lines sent
+while the app is down are lost; `scemd.log` on the Synology still has them.
+
+Set `SYNOLOGY_ADDRESS` to the Synology's address and publish
+`5140:5140/udp` (`SYNOLOGY_SYSLOG_PORT` changes the port). Datagrams from
+other addresses are ignored and logged once. Then, on the Synology, save
+this as `/usr/local/etc/syslog-ng/patterndb.d/disk-status-page.conf`
+(DSM includes that folder, and updates leave it alone), with the NAS's
+address in place of `NAS_ADDRESS`:
+
+```
+filter f_disk_status_page { program("scemd"); };
+destination d_disk_status_page {
+    network("NAS_ADDRESS" port(5140) transport("udp")
+            template("${ISODATE} ${HOST} ${MSGHDR}${MSG}\n"));
+};
+log { source(src); filter(f_disk_status_page); destination(d_disk_status_page); };
+```
+
+check it with `sudo syslog-ng --syntax-only` (a broken file would stop
+all of DSM's logging), then `sudo systemctl restart syslog-ng`. The template
+reproduces `scemd.log`'s own format, so past lines can be replayed into
+the app; repeated wakes are ignored:
+
+```bash
+# In bash, which provides /dev/udp.
+sudo grep hibernation_handler /var/log/scemd.log |
+  while IFS= read -r line; do printf '%s\n' "$line" > /dev/udp/NAS_ADDRESS/5140; done
+```
+
+The dashboard's Synology section shows the last wake, how long the disks
+had slept before it, wakes in the last day and week, and the recent wakes;
+`/api/homepage` has the same under `synology`. Every forwarded `scemd`
+line updates "Last log line received", so
+`logger -t scemd "forwarding test"` on the Synology checks the link.
+Wakes are kept for 400 days.
+
 ### Disk list
 
 The image contains no disk list. The app reads `/config/disks.json`, which

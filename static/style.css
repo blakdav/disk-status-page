@@ -23,3 +23,9 @@
 
 /* Backup job states. Problem is the one red: a failed, interrupted or overdue job. */
 .badge.ok{background:#2c4838;color:#b4e5a5}.badge.running{background:#293f46;color:#a4ced9}.badge.waiting{background:#30362f;color:#b9c4bd}.badge.problem{background:#4a2b2b;color:#f2aaa2}
+
+/* Synology sleep: labels beside their values, as in the storage panels. */
+#synology dl{display:grid;grid-template-columns:minmax(8rem,11rem) minmax(0,1fr);gap:12px 18px;margin:18px 0;max-width:38rem}
+#synology dl>div{display:contents}
+#synology dt,#synology dd{font-size:13px}
+#synology dd{text-align:left;font-variant-numeric:tabular-nums}
