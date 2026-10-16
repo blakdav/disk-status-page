@@ -53,9 +53,12 @@ Put the keys in `.env` beside `docker-compose.yml` (see
 [.env.example](.env.example)); Compose passes them in. Check them with
 `docker exec disk-status-page python app.py test-alert`.
 
-The app can't report its own failure. On the NAS, the homelab playbook adds
-a watchdog timer that sends a Pushover alert, with the same `.env`, when
-the dashboard stops answering.
+The app can't report its own failure. For that, set `HEARTBEAT_URL` to a
+dead man's switch: a Healthchecks.io check, or an Uptime Kuma push monitor,
+with its own Pushover integration. The app fetches it once a minute after
+each successful check, so the pings stop, and that service alerts, if the
+app hangs or keeps failing, or if Docker, the NAS or its network goes down.
+The heartbeat runs with or without the Pushover keys.
 
 ## Monitoring behavior
 

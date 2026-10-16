@@ -45,6 +45,7 @@ services:
       PUSHOVER_TOKEN: ${PUSHOVER_TOKEN:-}
       PUSHOVER_USER: ${PUSHOVER_USER:-}
       ALERT_LINK: ${ALERT_LINK:-}
+      HEARTBEAT_URL: ${HEARTBEAT_URL:-}
     volumes:
       # NVMe storage: recording history must not wake the monitored disks.
       # The vault mount is nofail, so Docker can start before it is mounted.

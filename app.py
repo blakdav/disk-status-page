@@ -81,6 +81,10 @@ ALERT_REMINDER = float(os.getenv('ALERT_REMINDER_HOURS', '24')) * 3600
 ALERT_CAPACITY = float(os.getenv('ALERT_CAPACITY_PERCENT', '90'))
 # Opened when a notification is tapped, e.g. the dashboard's address.
 ALERT_LINK = os.getenv('ALERT_LINK', '').strip()
+# Fetched once a minute while the checks run: a dead man's switch (for
+# example a Healthchecks.io check or an Uptime Kuma push monitor) that
+# alerts when the pings stop, which also covers the whole NAS going down.
+HEARTBEAT_URL = os.getenv('HEARTBEAT_URL', '').strip()
 # What a disk should be doing, from its configured role (a cold spare should
 # be asleep, a pool disk awake), and the power state that matches it.
 EXPECTED_STATES = {'awake': 'awake', 'asleep': 'standby'}
@@ -1246,9 +1250,17 @@ def process_alerts(payload, now, send):
 def run_alerts():
     while not STOP.wait(60):
         try:
-            process_alerts(snapshot(), time.time(), pushover)
+            if PUSHOVER_TOKEN and PUSHOVER_USER:
+                process_alerts(snapshot(), time.time(), pushover)
         except Exception:
+            # No heartbeat either: a check that keeps failing should page.
             logging.exception('Alert check failed')
+            continue
+        if HEARTBEAT_URL:
+            try:
+                urllib.request.urlopen(HEARTBEAT_URL, timeout=10).close()
+            except OSError as exc:
+                logging.warning('Heartbeat failed: %s', exc)
 
 
 def job_snapshot():
@@ -1628,11 +1640,12 @@ if __name__ == '__main__':
         except Exception:
             logging.exception('Collector stopped; health endpoint will become unhealthy')
     threading.Thread(target=worker, daemon=True).start()
-    if PUSHOVER_TOKEN and PUSHOVER_USER and not DEMO:
-        threading.Thread(target=run_alerts, daemon=True).start()
-        logging.info('Pushover alerts on')
-    elif not DEMO:
-        logging.info('Pushover alerts off: PUSHOVER_TOKEN and PUSHOVER_USER are not both set')
+    if not DEMO:
+        logging.info('Pushover alerts %s; heartbeat %s',
+                     'on' if PUSHOVER_TOKEN and PUSHOVER_USER else 'off (PUSHOVER_TOKEN and PUSHOVER_USER not both set)',
+                     'on' if HEARTBEAT_URL else 'off')
+        if (PUSHOVER_TOKEN and PUSHOVER_USER) or HEARTBEAT_URL:
+            threading.Thread(target=run_alerts, daemon=True).start()
     if SYNOLOGY_ADDRESSES and not DEMO:
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         listener.bind(('0.0.0.0', SYNOLOGY_PORT))

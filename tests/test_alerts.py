@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+import unittest.mock
 from unittest.mock import patch
 import app
 
@@ -112,3 +113,29 @@ class ProcessTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class HeartbeatTests(unittest.TestCase):
+    def run_passes(self, results):
+        """Run the loop once per entry: True for a good check, False for one
+        that raises. Returns how many heartbeats were sent."""
+        stop = unittest.mock.Mock()
+        stop.wait.side_effect = [False] * len(results) + [True]
+        outcomes = iter(results)
+
+        def check(*args):
+            if not next(outcomes):
+                raise RuntimeError('check failed')
+
+        pings = []
+        with patch('app.STOP', stop), patch('app.HEARTBEAT_URL', 'https://hc.example/ping'), \
+                patch('app.PUSHOVER_TOKEN', 't'), patch('app.PUSHOVER_USER', 'u'), \
+                patch('app.snapshot', return_value={}), patch('app.process_alerts', side_effect=check), \
+                patch('app.urllib.request.urlopen', side_effect=lambda *a, **k: pings.append(a[0]) or unittest.mock.MagicMock()), \
+                self.assertLogs(level='ERROR') if not all(results) else unittest.mock.MagicMock():
+            app.run_alerts()
+        return len(pings)
+
+    def test_pings_only_after_a_good_check(self):
+        self.assertEqual(self.run_passes([True, True]), 2)
+        self.assertEqual(self.run_passes([True, False, True]), 2)
