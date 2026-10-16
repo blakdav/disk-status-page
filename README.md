@@ -24,6 +24,39 @@ so on), so a refresh or a link opens the same one:
 
 `/api/status` includes `health`, the verdicts behind the overview.
 
+## Alerts
+
+With `PUSHOVER_TOKEN` (an application's API token) and `PUSHOVER_USER` (your
+user key) set, the app checks once a minute and sends a Pushover
+notification for:
+
+- a disk that needs attention: SMART failed, an unacknowledged warning
+  (including NVMe wear past 80%, a temperature or spare warning), or a disk
+  that can't be read;
+- a disk awake or asleep against its role for 30 minutes
+  (`ALERT_STATE_DELAY_MINUTES`);
+- an NVMe drive or the pool `ALERT_CAPACITY_PERCENT` (90) full;
+- a parity sync problem and a backup job problem, by the same rules as
+  `/healthz/sync` and `/healthz/backups`;
+- the collector stalling (one alert, not one per disk).
+
+A problem is sent once it has lasted `ALERT_DELAY_MINUTES` (5), again if its
+details change (for example a warning count rising), and a quiet "Resolved"
+message when it clears. One that clears within its delay is never sent.
+While anything is unresolved, a summary repeats every
+`ALERT_REMINDER_HOURS` (24; 0 turns it off). What has been sent is kept in
+the history database, so a restart neither repeats nor forgets alerts. A
+failed send is retried each minute. `ALERT_LINK` is opened when a
+notification is tapped.
+
+Put the keys in `.env` beside `docker-compose.yml` (see
+[.env.example](.env.example)); Compose passes them in. Check them with
+`docker exec disk-status-page python app.py test-alert`.
+
+The app can't report its own failure. On the NAS, the homelab playbook adds
+a watchdog timer that sends a Pushover alert, with the same `.env`, when
+the dashboard stops answering.
+
 ## Monitoring behavior
 
 - Checks power state every 30 seconds with the supplied Compose file using `hdparm -C`.

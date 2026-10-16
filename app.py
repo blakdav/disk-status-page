@@ -6,7 +6,9 @@ import hmac
 import secrets
 import queue
 import socket
-from urllib.parse import parse_qs, urlsplit
+import sys
+from urllib.parse import parse_qs, urlencode, urlsplit
+import urllib.request
 import logging
 import os
 from pathlib import Path
@@ -66,6 +68,19 @@ SYNOLOGY_LOG_LOCK = threading.Lock()
 SYSLOG_HEADER = re.compile(r'<\d{1,3}>1 (\S+) (\S+) (\S+) \S+ \S+ ')
 SYNOLOGY_WAKE = re.compile(r'woke up from hibernation', re.IGNORECASE)
 SYNOLOGY_RETENTION = 400 * 86400
+# Pushover alerts: one message when a problem appears (after it has lasted
+# ALERT_DELAY_MINUTES), another if its details change, one when it clears,
+# and a reminder every ALERT_REMINDER_HOURS while anything is unresolved
+# (0: none). A disk awake or asleep against its role waits longer, since
+# waking a spare on purpose is normal. Without both keys nothing is sent.
+PUSHOVER_TOKEN = os.getenv('PUSHOVER_TOKEN', '').strip()
+PUSHOVER_USER = os.getenv('PUSHOVER_USER', '').strip()
+ALERT_DELAY = float(os.getenv('ALERT_DELAY_MINUTES', '5')) * 60
+ALERT_STATE_DELAY = float(os.getenv('ALERT_STATE_DELAY_MINUTES', '30')) * 60
+ALERT_REMINDER = float(os.getenv('ALERT_REMINDER_HOURS', '24')) * 3600
+ALERT_CAPACITY = float(os.getenv('ALERT_CAPACITY_PERCENT', '90'))
+# Opened when a notification is tapped, e.g. the dashboard's address.
+ALERT_LINK = os.getenv('ALERT_LINK', '').strip()
 # What a disk should be doing, from its configured role (a cold spare should
 # be asleep, a pool disk awake), and the power state that matches it.
 EXPECTED_STATES = {'awake': 'awake', 'asleep': 'standby'}
@@ -1124,6 +1139,118 @@ def homepage_status(payload):
             'generated_at': payload['server_time']}
 
 
+def current_problems(payload):
+    """{key: (title, message, delay)} for everything worth an alert now."""
+    problems = {}
+    freshness = collector_freshness(payload)
+    if freshness['state'] != 'current':
+        # One alert for the collector, not one per disk it stopped reading.
+        problems['collector'] = ('Disk monitoring stalled',
+                                 f"Collector data {freshness['label'].lower()}", ALERT_DELAY)
+    for disk in payload['disks']:
+        if disk.get('stale'):
+            continue
+        smart = disk.get('smart') or {}
+        if disk.get('needs_attention'):
+            reasons = ([disk['error']] if disk.get('error') else []) + (
+                ['SMART health failed'] if smart.get('passed') is False else []) + list(
+                smart.get('active_warnings') or [])
+            if not reasons and disk.get('state') not in ('awake', 'standby'):
+                reasons = ['Power state unknown']
+            problems[f"disk:{disk['serial']}"] = (f"{disk['label']} needs attention",
+                                                  '; '.join(dict.fromkeys(reasons)) or 'Needs attention',
+                                                  ALERT_DELAY)
+        if disk.get('unexpected_state'):
+            actual = 'awake' if disk.get('state') == 'awake' else 'asleep'
+            problems[f"state:{disk['serial']}"] = (
+                f"{disk['label']} is {actual}",
+                f"{disk.get('role') or 'Disk'} should be {disk.get('expected_state')}", ALERT_STATE_DELAY)
+        capacity = disk.get('capacity') or {}
+        if disk.get('type') == 'nvme' and capacity.get('status') == 'available' and capacity.get('total_bytes'):
+            used = capacity['used_bytes'] / capacity['total_bytes'] * 100
+            if used >= ALERT_CAPACITY:
+                problems[f"capacity:{disk['serial']}"] = (f"{disk['label']} is {used:.0f}% full",
+                                                          f"{size_label(capacity.get('available_bytes'))} free",
+                                                          ALERT_DELAY)
+    pool = payload.get('pool') or {}
+    if pool.get('total_bytes') and pool.get('used_bytes') is not None:
+        used = pool['used_bytes'] / pool['total_bytes'] * 100
+        if used >= ALERT_CAPACITY:
+            problems['capacity:pool'] = (f'Pool is {used:.0f}% full',
+                                         f"{pool.get('available_label', 'Unknown')} available", ALERT_DELAY)
+    sync = sync_health(payload.get('snapraid') or {}, payload['server_time'])
+    if not sync['ok']:
+        problems['sync'] = ('Parity sync problem', '; '.join(sync['problems']), ALERT_DELAY)
+    backups = payload.get('backups') or {'jobs': []}
+    for job in backups['jobs']:
+        if job.get('problem'):
+            problems[f"backup:{job['id']}"] = (f"Backup: {job['name']}", job['problem'], ALERT_DELAY)
+    if backups.get('error'):
+        problems['backup-list'] = ('Backup list unreadable', backups['error'], ALERT_DELAY)
+    return problems
+
+
+def pushover(title, message, priority=0):
+    """Send one notification. True if Pushover accepted it."""
+    fields = {'token': PUSHOVER_TOKEN, 'user': PUSHOVER_USER, 'title': title[:250],
+              'message': message[:1024], 'priority': priority}
+    if ALERT_LINK:
+        fields['url'] = ALERT_LINK
+    try:
+        with urllib.request.urlopen('https://api.pushover.net/1/messages.json',
+                                    urlencode(fields).encode(), timeout=15) as response:
+            return response.status == 200
+    except OSError as exc:
+        detail = exc.read().decode(errors='replace')[:300] if hasattr(exc, 'read') else ''
+        logging.warning('Pushover did not accept "%s": %s %s', title, exc, detail)
+        return False
+
+
+def process_alerts(payload, now, send):
+    """Compare the current problems with those already alerted (kept in
+    SQLite, so a restart neither repeats nor forgets them) and send what
+    changed. A failed send is retried on the next pass."""
+    with connect() as db:
+        row = db.execute("SELECT payload FROM metadata WHERE name='alerts'").fetchone()
+    state = json.loads(row[0]) if row else {}
+    active = state.get('active', {})
+    problems = current_problems(payload)
+    for key, (title, message, delay) in problems.items():
+        entry = active.get(key) or {'since': now, 'notified': None}
+        entry.update(title=title, message=message)
+        if now - entry['since'] >= delay and entry['notified'] != message:
+            if send(title, message):
+                entry['notified'] = message
+        active[key] = entry
+    for key in [k for k in active if k not in problems]:
+        entry = active[key]
+        # Never announced: it cleared within its delay, so stay quiet.
+        if not entry['notified'] or send('Resolved: ' + entry['title'], entry['message'], -1):
+            del active[key]
+    notified = [e for e in active.values() if e['notified']]
+    if not notified:
+        state['reminded_at'] = None
+    elif not state.get('reminded_at'):
+        state['reminded_at'] = now
+    elif ALERT_REMINDER and now - state['reminded_at'] >= ALERT_REMINDER:
+        lines = [f"{e['title']}: {e['message']}" for e in notified]
+        if send(f'{len(notified)} unresolved', '\n'.join(lines)):
+            state['reminded_at'] = now
+    state['active'] = active
+    with connect() as db:
+        db.execute("INSERT INTO metadata VALUES ('alerts', ?) "
+                   "ON CONFLICT(name) DO UPDATE SET payload=excluded.payload", (json.dumps(state),))
+    return state
+
+
+def run_alerts():
+    while not STOP.wait(60):
+        try:
+            process_alerts(snapshot(), time.time(), pushover)
+        except Exception:
+            logging.exception('Alert check failed')
+
+
 def job_snapshot():
     with JOB_LOCK:
         return dict(JOB) if JOB else None
@@ -1465,6 +1592,11 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
+    # docker exec disk-status-page python app.py test-alert
+    if sys.argv[1:] == ['test-alert']:
+        if not (PUSHOVER_TOKEN and PUSHOVER_USER):
+            raise SystemExit('PUSHOVER_TOKEN and PUSHOVER_USER are not both set')
+        raise SystemExit(0 if pushover('Test alert', 'Disk Status Page alerts are working.') else 1)
     # The disk list belongs to the NAS, not the image: Ansible writes it from
     # its pool lists and Compose mounts it. Demo mode uses placeholder disks.
     disks_file = os.getenv('DISKS_FILE') or (
@@ -1496,6 +1628,11 @@ if __name__ == '__main__':
         except Exception:
             logging.exception('Collector stopped; health endpoint will become unhealthy')
     threading.Thread(target=worker, daemon=True).start()
+    if PUSHOVER_TOKEN and PUSHOVER_USER and not DEMO:
+        threading.Thread(target=run_alerts, daemon=True).start()
+        logging.info('Pushover alerts on')
+    elif not DEMO:
+        logging.info('Pushover alerts off: PUSHOVER_TOKEN and PUSHOVER_USER are not both set')
     if SYNOLOGY_ADDRESSES and not DEMO:
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         listener.bind(('0.0.0.0', SYNOLOGY_PORT))

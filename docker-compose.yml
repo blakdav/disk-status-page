@@ -40,6 +40,11 @@ services:
       # (README: "Synology disk sleep"); datagrams from any other address are
       # ignored. Empty turns the listener off.
       SYNOLOGY_ADDRESS: ""
+      # Pushover alerts (README: "Alerts"). The keys come from .env beside
+      # this file (see .env.example), never from this file itself.
+      PUSHOVER_TOKEN: ${PUSHOVER_TOKEN:-}
+      PUSHOVER_USER: ${PUSHOVER_USER:-}
+      ALERT_LINK: ${ALERT_LINK:-}
     volumes:
       # NVMe storage: recording history must not wake the monitored disks.
       # The vault mount is nofail, so Docker can start before it is mounted.
