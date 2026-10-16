@@ -6,7 +6,7 @@ import hmac
 import secrets
 import queue
 import socket
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 import logging
 import os
 from pathlib import Path
@@ -838,6 +838,31 @@ def synology_log_tail(lines=100):
     return text.splitlines()[-lines:][::-1] if text else []
 
 
+def synology_log_bytes():
+    """Both log files, oldest line first."""
+    parts = []
+    for path in (SYNOLOGY_LOG.with_name(SYNOLOGY_LOG.name + '.1'), SYNOLOGY_LOG):
+        try:
+            parts.append(path.read_bytes())
+        except FileNotFoundError:
+            pass
+    return b''.join(parts)
+
+
+def synology_log_page(query='', offset=0, limit=500):
+    """A page of the whole log, newest first, optionally only the lines
+    containing query (case-insensitive)."""
+    lines = synology_log_bytes().decode('utf-8', 'replace').splitlines()[::-1]
+    total = len(lines)
+    if query:
+        needle = query.casefold()
+        lines = [line for line in lines if needle in line.casefold()]
+    offset = max(0, offset)
+    limit = min(max(1, limit), 2000)
+    return {'total': total, 'matched': len(lines), 'offset': offset,
+            'lines': lines[offset:offset + limit]}
+
+
 def synology_status(now):
     if not SYNOLOGY_ADDRESSES:
         return {'configured': False}
@@ -1302,6 +1327,12 @@ def run_collector(configs):
 HEALTH_PATHS = ('/healthz', '/healthz/disks', '/healthz/sync', '/healthz/backups')
 
 
+STATIC_FILES = {'/': ('index.html', 'text/html'), '/app.js': ('app.js', 'text/javascript'),
+                '/style.css': ('style.css', 'text/css'),
+                '/synology-log': ('synology-log.html', 'text/html'),
+                '/synology-log.js': ('synology-log.js', 'text/javascript')}
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path not in ('/api/action', '/api/unlock'):
@@ -1392,19 +1423,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 body = json.dumps(homepage_status(payload) if path == '/api/homepage' else payload).encode()
             mime = 'application/json'
-        elif path == '/synology.log' and SYNOLOGY_ADDRESSES:
-            # The whole current log, newest last; older lines are in
-            # synology.log.1 on the NAS.
+        elif path == '/api/synology-log' and SYNOLOGY_ADDRESSES:
+            params = parse_qs(urlsplit(self.path).query)
             try:
-                body = SYNOLOGY_LOG.read_bytes()
-            except FileNotFoundError:
-                body = b''
+                offset = int(params.get('offset', ['0'])[0])
+                limit = int(params.get('limit', ['500'])[0])
+            except ValueError:
+                self.respond_json(400, {'error': 'offset and limit must be numbers'})
+                return
+            body = json.dumps(synology_log_page(params.get('q', [''])[0][:200], offset, limit)).encode()
+            mime = 'application/json'
+            self.send_response(200)
+        elif path == '/synology.log' and SYNOLOGY_ADDRESSES:
+            # The whole log, both files, newest line last.
+            body = synology_log_bytes()
             mime = 'text/plain'
             self.send_response(200)
-        elif path in ('/', '/app.js', '/style.css'):
-            file = ROOT / 'static' / ('index.html' if path == '/' else path[1:])
-            body = file.read_bytes()
-            mime = {'/': 'text/html', '/app.js': 'text/javascript', '/style.css': 'text/css'}[path]
+        elif path in STATIC_FILES:
+            body = (ROOT / 'static' / STATIC_FILES[path][0]).read_bytes()
+            mime = STATIC_FILES[path][1]
             self.send_response(200)
         else:
             self.send_error(404)

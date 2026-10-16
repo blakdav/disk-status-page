@@ -221,8 +221,11 @@ when the last line arrived, the recent wakes, and the newest log lines.
 also kept in `synology.log` in the history folder: the event's time, the
 Synology's name, the Log Center program and the message. At 20 MB
 (`SYNOLOGY_LOG_MB`) it becomes `synology.log.1`, replacing the previous one.
-`/synology.log` serves the current file. Lines in another format are kept
-too, marked `(unparsed)`. Wakes are kept for 400 days.
+The section's "View the full log" opens `/synology-log`: both files, newest
+first, 500 lines at a time, with a filter (case-insensitive, across both
+files). `/synology.log` downloads both files as one, oldest first. Lines in
+another format are kept too, marked `(unparsed)`. Wakes are kept for 400
+days.
 
 ### Disk list
 

@@ -80,6 +80,16 @@ class StoreTests(unittest.TestCase):
         self.assertTrue((self.dir / 'synology.log.1').exists())
         self.assertLess((self.dir / 'synology.log').stat().st_size, 400)
 
+    def test_full_log_spans_both_files_newest_first(self):
+        (self.dir / 'synology.log.1').write_text('one\ntwo Hibernation\n')
+        (self.dir / 'synology.log').write_text('three\nfour hibernation\n')
+        self.assertEqual(app.synology_log_bytes(), b'one\ntwo Hibernation\nthree\nfour hibernation\n')
+        page = app.synology_log_page()
+        self.assertEqual((page['total'], page['matched'], page['lines']), (4, 4, ['four hibernation', 'three', 'two Hibernation', 'one']))
+        page = app.synology_log_page('HIBERNATION', offset=1, limit=5)
+        self.assertEqual((page['total'], page['matched'], page['lines']), (4, 2, ['two Hibernation']))
+        self.assertEqual(len(app.synology_log_page(limit=10 ** 6)['lines']), 4)
+
     def test_wake_from_another_program_is_not_a_wake(self):
         app.record_synology_line(WAKE.replace(' System ', ' Connection '), self.now)
         self.assertEqual(app.synology_status(self.now)['wakes'], [])

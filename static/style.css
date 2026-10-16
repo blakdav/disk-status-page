@@ -30,3 +30,10 @@
 #synology dt,#synology dd{font-size:13px}
 #synology dd{text-align:left;font-variant-numeric:tabular-nums}
 #synology a{color:#a6df8c}
+/* Full Synology log page. */
+.log-page .eyebrow a{color:inherit;text-decoration:none}.log-page .eyebrow a:hover{color:#e5eee9}
+.button{font-size:12px;background:#294234;color:#e5eee9;border:1px solid #52735e;border-radius:7px;padding:9px 12px;text-decoration:none}
+#search{display:flex;gap:10px;margin-bottom:12px}#query{flex:1;min-width:0;font:inherit;font-size:13px;background:#18221d;color:#e5eee9;border:1px solid #35463c;border-radius:7px;padding:9px 12px}
+#count{font-size:12px;color:#99aaa2}
+#log{background:#18221d;border:1px solid #35463c;border-radius:12px;padding:16px;font:12px/1.6 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;min-height:6em}
+#more{margin-top:12px}
