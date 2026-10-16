@@ -54,7 +54,7 @@ function backupsHtml(backups) {
 // each wake but not when the disks went to sleep.
 function synologyHtml(s) {
   const rows = s.wakes.map(w => `<li><time>${esc(w.woke_label)}</time>Disks woke up from hibernation</li>`).join('') || '<li>No wakes recorded yet.</li>';
-  const log = s.log.length ? `<p><a href="/synology-log">View the full log</a></p><details><summary>Recent log lines (newest first)</summary><pre>${esc(s.log.join('\n'))}</pre></details>` : '<p>No log lines received yet.</p>';
+  const log = `<p><a href="/synology-log">View the full log</a></p>` + (s.log.length ? `<details><summary>Recent log lines (newest first)</summary><pre>${esc(s.log.join('\n'))}</pre></details>` : '<p>No log lines received yet.</p>');
   return `<h2>Synology disk sleep</h2><dl><div><dt>Last wake</dt><dd>${esc(s.last_wake_label)}</dd></div><div><dt>Wakes, last 24 hours</dt><dd>${esc(s.wakes_24h)}</dd></div><div><dt>Wakes, last 7 days</dt><dd>${esc(s.wakes_7d)}</dd></div><div><dt>Last log line received</dt><dd>${s.last_line_at ? date(s.last_line_at) : 'None yet'}</dd></div></dl><p>From the Synology's Log Center, sent by its Log Sending as each event happens. It records when the disks wake, not when they went to sleep.</p><ol>${rows}</ol>${log}`;
 }
 function render(data) {
