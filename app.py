@@ -16,7 +16,6 @@ import subprocess
 import threading
 import time
 from datetime import datetime
-from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).parent
@@ -51,20 +50,21 @@ CONFIGS = []
 BACKUP_JOBS = []
 BACKUP_LIST_ERROR = None
 BACKUP_DIR = '/host/backups'
-# The Synology's disk sleep log. Its syslog-ng forwards scemd's lines here
-# over UDP (README: "Synology disk sleep"); only these addresses are heard.
-# Empty turns the listener off. A wake writes, for example:
-#   2026-10-13T15:19:22-05:00 DiskStation scemd[11897]: event_disk_hibernation_handler.c:47
-#   The internal disks wake up, hibernate from [Oct 12 11:35:23]
-# Nothing is logged when the disks go to sleep; the bracketed time says when
-# they did. It has no zone or year: it is the Synology's local time
-# (SYNOLOGY_TZ), while the line's own stamp carries its offset.
+# The Synology's log, from DSM's Log Center > Log Sending (UDP, IETF/RFC
+# 5424 format). Only datagrams from these addresses are heard; empty turns
+# the listener off. Log Sending forwards Log Center's events, among them
+# "Internal disks woke up from hibernation." from System. DSM logs nothing
+# when the disks go to sleep. Every line received is also kept, as text,
+# in synology.log beside the history database.
 SYNOLOGY_ADDRESSES = {a.strip() for a in os.getenv('SYNOLOGY_ADDRESS', '').split(',') if a.strip()}
 SYNOLOGY_PORT = int(os.getenv('SYNOLOGY_SYSLOG_PORT', '5140'))
-SYNOLOGY_TZ = os.getenv('SYNOLOGY_TZ', 'America/Los_Angeles')
-SYNOLOGY_LINE = re.compile(r'(?:<\d+>)?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:[+-]\d\d:\d\d|Z)) '
-                           r'\S+ scemd(?:\[\d+\])?: (.*)')
-SYNOLOGY_WAKE = re.compile(r'The internal disks wake up, hibernate from \[([A-Z][a-z]{2} +\d{1,2} \d\d:\d\d:\d\d)\]')
+SYNOLOGY_LOG = DB.parent / 'synology.log'
+# synology.log is renamed to synology.log.1 (replacing it) at this size.
+SYNOLOGY_LOG_MAX = int(float(os.getenv('SYNOLOGY_LOG_MB', '20')) * 2 ** 20)
+SYNOLOGY_LOG_LOCK = threading.Lock()
+# <PRI>1 TIMESTAMP HOST APP-NAME PROCID MSGID, then structured data and MSG.
+SYSLOG_HEADER = re.compile(r'<\d{1,3}>1 (\S+) (\S+) (\S+) \S+ \S+ ')
+SYNOLOGY_WAKE = re.compile(r'woke up from hibernation', re.IGNORECASE)
 SYNOLOGY_RETENTION = 400 * 86400
 # What a disk should be doing, from its configured role (a cold spare should
 # be asleep, a pool disk awake), and the power state that matches it.
@@ -191,8 +191,7 @@ def initialize():
                    'acknowledged_at REAL, PRIMARY KEY(serial, attribute_id))')
         db.execute('CREATE TABLE IF NOT EXISTS extended_tests '
                    '(serial TEXT PRIMARY KEY, payload TEXT NOT NULL)')
-        db.execute('CREATE TABLE IF NOT EXISTS synology_wakes '
-                   '(woke_at REAL PRIMARY KEY, slept_at REAL)')
+        db.execute('CREATE TABLE IF NOT EXISTS synology_wakes (woke_at REAL PRIMARY KEY)')
 
 
 def command(args):
@@ -741,51 +740,68 @@ def backups_health(backups):
     return {'ok': not problems, 'problems': problems}
 
 
-def parse_synology_line(line):
-    """(logged_at, wake) for one forwarded scemd line, or None for anything
-    else. wake is None for other scemd lines, else (woke_at, slept_at), with
-    slept_at None if the bracketed time can't be placed before the wake."""
-    match = SYNOLOGY_LINE.fullmatch(line.strip())
+def parse_syslog(line):
+    """{logged_at, host, app, message} for an RFC 5424 line, or None."""
+    match = SYSLOG_HEADER.match(line)
     if not match:
         return None
     try:
-        logged = datetime.fromisoformat(match[1])
+        logged_at = datetime.fromisoformat(match[1]).timestamp()
     except ValueError:
         return None
-    wake = SYNOLOGY_WAKE.search(match[2])
-    if not wake:
-        return logged.timestamp(), None
-    woke_at = logged.timestamp()
-    zone = ZoneInfo(SYNOLOGY_TZ)
-    local = datetime.fromtimestamp(woke_at, zone)
-    try:
-        slept = datetime.strptime(f'{local.year} {wake[1]}', '%Y %b %d %H:%M:%S')
-        # A wake in January may follow a sleep that began in December.
-        if slept.month > local.month:
-            slept = slept.replace(year=local.year - 1)
-        slept_at = slept.replace(tzinfo=zone).timestamp()
-    except ValueError:
-        slept_at = None
-    if slept_at is not None and not 0 <= woke_at - slept_at <= 366 * 86400:
-        slept_at = None
-    return woke_at, (woke_at, slept_at)
+    rest = line[match.end():]
+    # Structured data: "-", or [elements] whose values escape "]" as "\]".
+    if rest.startswith('-'):
+        i = 1
+    else:
+        i = 0
+        while i < len(rest) and rest[i] == '[':
+            i += 1
+            while i < len(rest) and rest[i] != ']':
+                i += 2 if rest[i] == '\\' else 1
+            i += 1
+    # DSM starts the message with a UTF-8 byte order mark, as RFC 5424 allows.
+    message = rest[i:].removeprefix(' ').removeprefix('\ufeff')
+    return {'logged_at': logged_at, 'host': match[2], 'app': match[3], 'message': message}
+
+
+def printable(text):
+    return ''.join(c if c.isprintable() else ' ' for c in text)[:2000]
+
+
+def append_synology_log(text):
+    with SYNOLOGY_LOG_LOCK:
+        try:
+            if SYNOLOGY_LOG.stat().st_size >= SYNOLOGY_LOG_MAX:
+                SYNOLOGY_LOG.replace(SYNOLOGY_LOG.with_name(SYNOLOGY_LOG.name + '.1'))
+        except FileNotFoundError:
+            pass
+        with SYNOLOGY_LOG.open('a', encoding='utf-8') as log:
+            log.write(text + '\n')
 
 
 def record_synology_line(line, now):
-    """Store a forwarded line's wake, if it has one. True if it was a scemd line."""
-    parsed = parse_synology_line(line)
-    if not parsed:
+    """Keep one forwarded line, and store its wake if it reports one. True
+    if it was an RFC 5424 line."""
+    line = line.strip()
+    if not line:
         return False
-    logged_at, wake = parsed
-    if logged_at > now + 300:
+    event = parse_syslog(line)
+    if not event or event['logged_at'] > now + 300:
+        # Kept verbatim with the time it arrived, e.g. when Log Sending is
+        # set to the BSD format by mistake.
+        append_synology_log(f"{datetime.fromtimestamp(now).astimezone().isoformat(timespec='seconds')} "
+                            f"(unparsed) {printable(line)}")
         return False
+    stamp = datetime.fromtimestamp(event['logged_at']).astimezone().isoformat(timespec='seconds')
+    append_synology_log(f"{stamp} {printable(event['host'])} {printable(event['app'])}: {printable(event['message'])}")
     with connect() as db:
         db.execute("INSERT INTO metadata VALUES ('synology', ?) "
                    "ON CONFLICT(name) DO UPDATE SET payload=excluded.payload",
-                   (json.dumps({'last_line_at': logged_at, 'last_received_at': now}),))
-        if wake:
-            # Resent or replayed lines are ignored: one wake per moment.
-            db.execute('INSERT OR IGNORE INTO synology_wakes VALUES (?, ?)', wake)
+                   (json.dumps({'last_line_at': event['logged_at'], 'last_received_at': now}),))
+        if event['app'] == 'System' and SYNOLOGY_WAKE.search(event['message']):
+            # A resent line is ignored: one wake per moment.
+            db.execute('INSERT OR IGNORE INTO synology_wakes (woke_at) VALUES (?)', (event['logged_at'],))
             db.execute('DELETE FROM synology_wakes WHERE woke_at < ?', (now - SYNOLOGY_RETENTION,))
     return True
 
@@ -794,7 +810,7 @@ def run_synology_listener(sock):
     refused = set()
     while not STOP.is_set():
         try:
-            data, (host, _) = sock.recvfrom(4096)
+            data, (host, _) = sock.recvfrom(8192)
         except OSError:
             if sock.fileno() == -1:
                 return
@@ -807,37 +823,35 @@ def run_synology_listener(sock):
         for line in data.decode('utf-8', 'replace').splitlines():
             try:
                 record_synology_line(line, time.time())
-            except (sqlite3.Error, ValueError, OverflowError):
+            except (OSError, sqlite3.Error, ValueError, OverflowError):
                 logging.exception('Could not record Synology log line')
 
 
-def duration_label(seconds):
-    minutes = int(seconds // 60)
-    days, minutes = divmod(minutes, 1440)
-    hours, minutes = divmod(minutes, 60)
-    return (f'{days}d {hours}h' if days else f'{hours}h {minutes}m' if hours else f'{minutes}m')
+def synology_log_tail(lines=100):
+    """The newest lines of synology.log, newest first."""
+    try:
+        with SYNOLOGY_LOG.open('rb') as log:
+            log.seek(max(0, log.seek(0, os.SEEK_END) - 64 * 1024))
+            text = log.read().decode('utf-8', 'replace')
+    except FileNotFoundError:
+        return []
+    return text.splitlines()[-lines:][::-1] if text else []
 
 
 def synology_status(now):
     if not SYNOLOGY_ADDRESSES:
         return {'configured': False}
     with connect() as db:
-        rows = db.execute('SELECT woke_at, slept_at FROM synology_wakes '
-                          'ORDER BY woke_at DESC LIMIT 30').fetchall()
+        rows = db.execute('SELECT woke_at FROM synology_wakes ORDER BY woke_at DESC LIMIT 30').fetchall()
         day, week = (db.execute('SELECT COUNT(*) FROM synology_wakes WHERE woke_at > ?',
                                 (now - span,)).fetchone()[0] for span in (86400, 7 * 86400))
         meta = db.execute("SELECT payload FROM metadata WHERE name='synology'").fetchone()
     meta = json.loads(meta[0]) if meta else {}
-    wakes = [{'woke_at': woke, 'slept_at': slept,
-              'woke_label': pacific(woke, year=False),
-              'slept_label': pacific(slept, year=False) if slept else None,
-              'asleep_label': duration_label(woke - slept) if slept else None}
-             for woke, slept in rows]
-    last = wakes[0] if wakes else None
+    wakes = [{'woke_at': woke, 'woke_label': pacific(woke, year=False)} for (woke,) in rows]
     return {'configured': True, 'wakes': wakes, 'wakes_24h': day, 'wakes_7d': week,
             'last_line_at': meta.get('last_line_at'),
-            'last_wake_label': last['woke_label'] if last else 'None recorded',
-            'last_asleep_label': (last['asleep_label'] or 'Unknown') if last else 'None recorded'}
+            'last_wake_label': wakes[0]['woke_label'] if wakes else 'None recorded',
+            'log': synology_log_tail()}
 
 
 def filesystem_capacity(path, now):
@@ -993,15 +1007,13 @@ def drive_card(disk):
 
 
 def synology_card(synology):
-    """The Synology's sleep history as ready-made text for a Homepage card."""
+    """The Synology's wakes as ready-made text for a Homepage card."""
     if not synology.get('configured'):
         return {'configured': False, 'description': 'Not set up'}
-    last = synology['wakes'][0] if synology['wakes'] else None
-    description = (f"Woke {last['woke_label']}" + (f" after {last['asleep_label']} asleep" if last['asleep_label'] else '')
-                   if last else 'No wakes recorded yet')
-    return {'configured': True, 'description': description,
+    return {'configured': True,
+            'description': (f"Last woke {synology['last_wake_label']}" if synology['wakes']
+                            else 'No wakes recorded yet'),
             'last_wake_label': synology['last_wake_label'],
-            'last_asleep_label': synology['last_asleep_label'],
             'wakes_24h': synology['wakes_24h'], 'wakes_7d': synology['wakes_7d']}
 
 
@@ -1380,6 +1392,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 body = json.dumps(homepage_status(payload) if path == '/api/homepage' else payload).encode()
             mime = 'application/json'
+        elif path == '/synology.log' and SYNOLOGY_ADDRESSES:
+            # The whole current log, newest last; older lines are in
+            # synology.log.1 on the NAS.
+            try:
+                body = SYNOLOGY_LOG.read_bytes()
+            except FileNotFoundError:
+                body = b''
+            mime = 'text/plain'
+            self.send_response(200)
         elif path in ('/', '/app.js', '/style.css'):
             file = ROOT / 'static' / ('index.html' if path == '/' else path[1:])
             body = file.read_bytes()
@@ -1437,5 +1458,5 @@ if __name__ == '__main__':
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         listener.bind(('0.0.0.0', SYNOLOGY_PORT))
         threading.Thread(target=run_synology_listener, args=(listener,), daemon=True).start()
-        logging.info('Listening for the Synology\'s disk log on UDP %d', SYNOLOGY_PORT)
+        logging.info('Listening for the Synology\'s log on UDP %d', SYNOLOGY_PORT)
     ThreadingHTTPServer(('0.0.0.0', int(os.getenv('PORT', '8080'))), Handler).serve_forever()

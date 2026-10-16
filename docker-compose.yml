@@ -25,7 +25,7 @@ services:
       - /tmp
     ports:
       - "8088:8080"
-      # The Synology's forwarded disk log (SYNOLOGY_ADDRESS below).
+      # The Synology's Log Sending (SYNOLOGY_ADDRESS below).
       - "5140:5140/udp"
     environment:
       TZ: America/Los_Angeles
@@ -36,9 +36,9 @@ services:
       # refuse requests addressed to any other name (DNS rebinding). Add the
       # Nginx Proxy Manager hostname here if you put one in front.
       ALLOWED_HOSTS: "172.23.24.16,debian-nas"
-      # The Synology whose disk sleep log is forwarded here; datagrams from
-      # any other address are ignored. Empty turns the listener off.
-      # SYNOLOGY_TZ is the time zone set in its DSM (default Pacific).
+      # The Synology whose Log Center events its Log Sending forwards here
+      # (README: "Synology disk sleep"); datagrams from any other address are
+      # ignored. Empty turns the listener off.
       SYNOLOGY_ADDRESS: ""
     volumes:
       # NVMe storage: recording history must not wake the monitored disks.

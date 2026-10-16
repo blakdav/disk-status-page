@@ -50,11 +50,12 @@ function backupsHtml(backups) {
     return `<article class="backup"><div class="card-top"><div><h3>${esc(j.name)}</h3><p>${esc(j.method || '')}${j.method ? ' · ' : ''}${esc(j.schedule_label)}</p></div><span class="badge ${esc(j.state)}">${esc(BACKUP_BADGES[j.state] || j.state)}</span></div>${j.problem ? `<p class="warning">${esc(j.problem)}</p>` : ''}<dl><div><dt>Status</dt><dd>${esc(j.state_label)}</dd></div><div><dt>Last success</dt><dd>${esc(j.last_success_label)}</dd></div><div><dt>Last run ended</dt><dd>${j.finished_at ? date(j.finished_at) : 'Not recorded'}</dd></div><div><dt>Last result</dt><dd>${esc(j.result_label)}</dd></div>${restic}</dl><p class="read-time">Overdue after ${esc(j.max_age_label)} without a success</p></article>`;
   }).join('');
 }
-// The Synology logs only its wakes, each with when the disks had gone to
-// sleep, so between wakes its current state is unknown.
+// The Synology's Log Center events, forwarded by its Log Sending. DSM logs
+// each wake but not when the disks went to sleep.
 function synologyHtml(s) {
-  const rows = s.wakes.map(w => `<li><time>${esc(w.woke_label)}</time><strong>Woke</strong>${w.slept_label ? `asleep since ${esc(w.slept_label)} · ${esc(w.asleep_label)}` : 'sleep start unknown'}</li>`).join('') || '<li>No wakes recorded yet.</li>';
-  return `<h2>Synology disk sleep</h2><dl><div><dt>Last wake</dt><dd>${esc(s.last_wake_label)}</dd></div><div><dt>Asleep before it</dt><dd>${esc(s.last_asleep_label)}</dd></div><div><dt>Wakes, last 24 hours</dt><dd>${esc(s.wakes_24h)}</dd></div><div><dt>Wakes, last 7 days</dt><dd>${esc(s.wakes_7d)}</dd></div><div><dt>Last log line received</dt><dd>${s.last_line_at ? date(s.last_line_at) : 'None yet'}</dd></div></dl><p>From the Synology's own log, forwarded as it is written. It records each wake and when the disks had gone to sleep; nothing arrives while they sleep.</p><ol>${rows}</ol>`;
+  const rows = s.wakes.map(w => `<li><time>${esc(w.woke_label)}</time>Disks woke up from hibernation</li>`).join('') || '<li>No wakes recorded yet.</li>';
+  const log = s.log.length ? `<details><summary>Recent log lines (newest first) · <a href="/synology.log">full log</a></summary><pre>${esc(s.log.join('\n'))}</pre></details>` : '<p>No log lines received yet.</p>';
+  return `<h2>Synology disk sleep</h2><dl><div><dt>Last wake</dt><dd>${esc(s.last_wake_label)}</dd></div><div><dt>Wakes, last 24 hours</dt><dd>${esc(s.wakes_24h)}</dd></div><div><dt>Wakes, last 7 days</dt><dd>${esc(s.wakes_7d)}</dd></div><div><dt>Last log line received</dt><dd>${s.last_line_at ? date(s.last_line_at) : 'None yet'}</dd></div></dl><p>From the Synology's Log Center, sent by its Log Sending as each event happens. It records when the disks wake, not when they went to sleep.</p><ol>${rows}</ol>${log}`;
 }
 function render(data) {
   latest = data;

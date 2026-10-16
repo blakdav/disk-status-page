@@ -170,7 +170,7 @@
             name: name
             label: description
             limit: 10
-    # The Synology's disk sleep, from its own log (README: "Synology disk
+    # The Synology's disk wakes, from its Log Center (README: "Synology disk
     # sleep"). No status dot: waking is not a fault.
     - Synology Disks:
         href: http://NAS_ADDRESS:8088
@@ -183,9 +183,6 @@
           mappings:
             - field: synology.last_wake_label
               label: Last wake
-              format: text
-            - field: synology.last_asleep_label
-              label: Asleep before
               format: text
             - field: synology.wakes_24h
               label: Wakes (24 h)

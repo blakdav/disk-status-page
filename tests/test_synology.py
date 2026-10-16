@@ -1,4 +1,3 @@
-import os
 import socket
 import tempfile
 import threading
@@ -9,9 +8,13 @@ from pathlib import Path
 from unittest.mock import patch
 import app
 
-WAKE = ('2026-10-13T15:19:22-05:00 DiskStation scemd[11897]: event_disk_hibernation_handler.c:47 '
-        'The internal disks wake up, hibernate from [Oct 12 11:35:23]')
-OTHER = '2026-10-13T15:19:22-05:00 DiskStation scemd[11897]: disk/disk_config_single.c:352 /dev/sda apply wd idle off'
+# As DSM's Log Sending sends them (IETF format), BOM included.
+LOGIN = ('<14>1 2026-10-15T21:49:07-07:00 DiskStation Connection - - [synolog@6574 event_id="0x0001" '
+         'synotype="Connection" username="blake" event="User [blake\\] from [192.0.2.3\\] logged in '
+         'successfully via [SSH\\]." arg_4="SSH"][meta sequenceId="1"] ﻿User [blake] from [192.0.2.3] '
+         'logged in successfully via [SSH].')
+WAKE = ('<14>1 2026-10-15T21:17:27-07:00 DiskStation System - - [meta sequenceId="1"] '
+        '﻿Internal disks woke up from hibernation.')
 
 
 def ts(text):
@@ -19,55 +22,69 @@ def ts(text):
 
 
 class ParseTests(unittest.TestCase):
-    def test_wake_line(self):
-        logged, wake = app.parse_synology_line(WAKE)
-        self.assertEqual(logged, ts('2026-10-13T15:19:22-05:00'))
-        # The bracket is Pacific (SYNOLOGY_TZ), unlike the line's -05:00 stamp.
-        self.assertEqual(wake, (logged, ts('2026-10-12T11:35:23-07:00')))
+    def test_structured_data_with_escaped_brackets(self):
+        event = app.parse_syslog(LOGIN)
+        self.assertEqual(event, {'logged_at': ts('2026-10-15T21:49:07-07:00'), 'host': 'DiskStation',
+                                 'app': 'Connection',
+                                 'message': 'User [blake] from [192.0.2.3] logged in successfully via [SSH].'})
 
-    def test_other_scemd_lines_count_but_are_not_wakes(self):
-        self.assertEqual(app.parse_synology_line(OTHER), (ts('2026-10-13T15:19:22-05:00'), None))
-        self.assertEqual(app.parse_synology_line('<30>' + OTHER)[1], None)
+    def test_no_structured_data(self):
+        event = app.parse_syslog('<14>1 2026-10-15T21:17:27-07:00 DiskStation System - - - hello')
+        self.assertEqual(event['message'], 'hello')
 
-    def test_foreign_lines_are_ignored(self):
-        for line in ('', 'garbage', OTHER.replace('scemd', 'sshd'),
-                     '2026-13-40T99:00:00-05:00 DiskStation scemd[1]: x'):
-            self.assertIsNone(app.parse_synology_line(line), line)
-
-    def test_sleep_from_the_previous_year(self):
-        line = WAKE.replace('2026-10-13', '2027-01-01').replace('Oct 12', 'Dec 31')
-        logged, (woke, slept) = app.parse_synology_line(line)
-        self.assertEqual(slept, ts('2026-12-31T11:35:23-08:00'))
-
-    def test_sleep_after_the_wake_is_unknown(self):
-        line = WAKE.replace('Oct 12 11:35:23', 'Oct 13 23:00:00')
-        self.assertIsNone(app.parse_synology_line(line)[1][1])
+    def test_other_formats_are_not_parsed(self):
+        for line in ('', 'garbage', '<14>Oct 15 21:17:27 DiskStation System: hello',
+                     '<14>1 not-a-time DiskStation System - - - hello'):
+            self.assertIsNone(app.parse_syslog(line), line)
 
 
 class StoreTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        for target, value in (('app.DB', Path(directory.name) / 'h.sqlite3'),
+        self.dir = Path(directory.name)
+        for target, value in (('app.DB', self.dir / 'h.sqlite3'),
+                              ('app.SYNOLOGY_LOG', self.dir / 'synology.log'),
                               ('app.SYNOLOGY_ADDRESSES', {'127.0.0.1'})):
             p = patch(target, value)
             p.start()
             self.addCleanup(p.stop)
         app.initialize()
-        self.now = ts('2026-10-13T16:00:00-05:00')
+        self.now = ts('2026-10-15T22:00:00-07:00')
 
     def test_wakes_are_stored_once_and_counted(self):
         for _ in range(2):
             self.assertTrue(app.record_synology_line(WAKE, self.now))
-        self.assertTrue(app.record_synology_line(OTHER, self.now))
+        self.assertTrue(app.record_synology_line(LOGIN, self.now))
         status = app.synology_status(self.now)
         self.assertEqual((status['wakes_24h'], status['wakes_7d'], len(status['wakes'])), (1, 1, 1))
-        self.assertEqual(status['last_asleep_label'], '1d 1h')
-        self.assertEqual(status['last_line_at'], ts('2026-10-13T15:19:22-05:00'))
-        card = app.synology_card(status)
-        self.assertEqual(card['description'], 'Woke Oct 13, 1:19 PM after 1d 1h asleep')
+        self.assertEqual(status['last_wake_label'], 'Oct 15, 9:17 PM')
+        self.assertEqual(status['last_line_at'], ts('2026-10-15T21:49:07-07:00'))
+        self.assertEqual(app.synology_card(status)['description'], 'Last woke Oct 15, 9:17 PM')
 
-    def test_future_lines_are_refused(self):
+    def test_every_line_is_kept_in_the_log(self):
+        app.record_synology_line(WAKE, self.now)
+        app.record_synology_line(LOGIN, self.now)
+        app.record_synology_line('<14>Oct 15 bsd \x1b[31mline', self.now)
+        log = app.synology_status(self.now)['log']
+        self.assertEqual(len(log), 3)
+        self.assertIn('(unparsed) <14>Oct 15 bsd  [31mline', log[0])
+        self.assertIn('DiskStation Connection: User [blake]', log[1])
+        self.assertIn('DiskStation System: Internal disks woke up from hibernation.', log[2])
+        self.assertNotIn('﻿', (self.dir / 'synology.log').read_text())
+
+    def test_log_rotates_at_its_size_limit(self):
+        with patch('app.SYNOLOGY_LOG_MAX', 200):
+            for _ in range(5):
+                app.record_synology_line(LOGIN, self.now)
+        self.assertTrue((self.dir / 'synology.log.1').exists())
+        self.assertLess((self.dir / 'synology.log').stat().st_size, 400)
+
+    def test_wake_from_another_program_is_not_a_wake(self):
+        app.record_synology_line(WAKE.replace(' System ', ' Connection '), self.now)
+        self.assertEqual(app.synology_status(self.now)['wakes'], [])
+
+    def test_future_lines_are_not_wakes(self):
         self.assertFalse(app.record_synology_line(WAKE, self.now - 3600))
         self.assertEqual(app.synology_status(self.now)['wakes'], [])
 
@@ -79,16 +96,20 @@ class StoreTests(unittest.TestCase):
     def test_listener_hears_only_the_synology(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(('127.0.0.1', 0))
-        port = sock.getsockname()[1]
         self.addCleanup(sock.close)
+        port = sock.getsockname()[1]
         threading.Thread(target=app.run_synology_listener, args=(sock,), daemon=True).start()
         sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addCleanup(sender.close)
+        # The listener uses the real clock, so the line must be recent.
+        self.now = time.time()
+        stamp = datetime.fromtimestamp(self.now - 60).astimezone().isoformat(timespec='seconds')
+        wake = WAKE.replace('2026-10-15T21:17:27-07:00', stamp).encode()
         with patch('app.SYNOLOGY_ADDRESSES', {'127.0.0.2'}):
-            sender.sendto(WAKE.encode(), ('127.0.0.1', port))
+            sender.sendto(wake, ('127.0.0.1', port))
             time.sleep(0.3)
         self.assertEqual(app.synology_status(self.now)['wakes'], [])
-        sender.sendto((WAKE + '\n').encode(), ('127.0.0.1', port))
+        sender.sendto(wake, ('127.0.0.1', port))
         deadline = time.time() + 3
         while time.time() < deadline and not app.synology_status(self.now)['wakes']:
             time.sleep(0.05)
