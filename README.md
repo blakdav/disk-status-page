@@ -6,6 +6,24 @@ dashboard. No third-party Python dependencies, frontend build, or database
 server. Monitoring is passive by default; authenticated controls can wake
 disks, put unmounted spares in standby, or request extended SMART self-tests.
 
+## Dashboard layout
+
+The dashboard is split into tabs, kept in the URL (`#disks`, `#backups`, and
+so on), so a refresh or a link opens the same one:
+
+- **Overview**: a tile each for disks, parity sync, backups, the pool and the
+  Synology. Disks, parity sync and backups are green or red by the same
+  rules as the `/healthz/*` URLs; the pool and Synology tiles are
+  information only. Below them, every current problem in one list, and a
+  table with one row per disk. `#disks/<serial>` opens a disk's card.
+- **Disks**: grouped into NVMe drives, the pool, and cold spares (disks
+  expected asleep). Each card shows state, health, temperature and any
+  warning; the rest, including the controls, is under Details.
+- **Backups**, **Parity & capacity**, **Synology** (when set up) and
+  **History** (observed power transitions).
+
+`/api/status` includes `health`, the verdicts behind the overview.
+
 ## Monitoring behavior
 
 - Checks power state every 30 seconds with the supplied Compose file using `hdparm -C`.

@@ -1421,6 +1421,11 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps(result).encode()
             else:
                 self.send_response(200)
+                if path == '/api/status':
+                    # The same verdicts as the health URLs, for the overview.
+                    payload['health'] = {'disks': disks_health(payload),
+                                         'sync': sync_health(payload.get('snapraid', {}), payload['server_time']),
+                                         'backups': backups_health(payload.get('backups') or {'jobs': []})}
                 body = json.dumps(homepage_status(payload) if path == '/api/homepage' else payload).encode()
             mime = 'application/json'
         elif path == '/api/synology-log' and SYNOLOGY_ADDRESSES:

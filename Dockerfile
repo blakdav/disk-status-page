@@ -4,7 +4,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends hdparm smartmontools \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY app.py disks.example.json ./
+COPY app.py disks.example.json backups.example.json ./
 COPY static ./static
 ENV PYTHONUNBUFFERED=1 DATA_DIR=/data
 EXPOSE 8080
